@@ -22,9 +22,8 @@ mcpServers:
   # PCLI2 MCP server for Physna operations
   pcli2-mcp:
     type: "local"
-    name: "pcli2"
-    command: ["/Users/julian/projects/physna/pcli2-mcp/target/release/pcli2-mcp", "--stdio"]
-    options: {}
+    command: ["/Users/julian/projects/physna/pcli2-mcp/target/release/pcli2-mcp"]
+    # Note: No --stdio flag needed as mcphost handles stdio transport automatically
 
 # Model configuration
 model: "ollama:qwen3:8b"  # Using your Qwen3 model
