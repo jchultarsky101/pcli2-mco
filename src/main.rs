@@ -1,523 +1,397 @@
 use anyhow::Result;
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use tokio::io::{stdin, stdout};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
-use async_trait::async_trait;
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use tracing::{debug, info};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-#[derive(Parser)]
-#[command(name = "pcli2-mcp")]
-#[command(about = "MCP server for PCLI2 integration with Ollama")]
+#[derive(Parser, Debug)]
+#[command(name = "mcp-http-server")]
+#[command(about = "A simple MCP server over HTTP")]
 struct Args {
-    /// Enable verbose logging
-    #[arg(short, long)]
-    verbose: bool,
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
 }
 
-// Define the basic structures for our MCP server
-#[derive(Debug, Clone)]
-pub struct ServerCapabilities {
-    pub tools: bool,
+#[derive(Clone)]
+struct AppState {
+    server_name: String,
+    server_version: String,
 }
 
-impl ServerCapabilities {
-    pub fn builder() -> ServerCapabilitiesBuilder {
-        ServerCapabilitiesBuilder::default()
-    }
+#[derive(Debug, Deserialize)]
+struct RpcRequest {
+    jsonrpc: Option<String>,
+    id: Option<Value>,
+    method: String,
+    params: Option<Value>,
 }
 
-#[derive(Default)]
-pub struct ServerCapabilitiesBuilder {
-    tools: bool,
+#[derive(Debug, Serialize)]
+struct RpcResponse {
+    jsonrpc: &'static str,
+    id: Value,
+    result: Value,
 }
 
-impl ServerCapabilitiesBuilder {
-    pub fn enable_tools(mut self) -> Self {
-        self.tools = true;
-        self
-    }
-
-    pub fn build(self) -> ServerCapabilities {
-        ServerCapabilities {
-            tools: self.tools,
-        }
-    }
+#[derive(Debug, Serialize)]
+struct RpcErrorResponse {
+    jsonrpc: &'static str,
+    id: Value,
+    error: RpcErrorBody,
 }
 
-#[derive(Debug, Clone)]
-pub struct ServerInfo {
-    pub name: String,
-    pub version: String,
-    pub instructions: Option<String>,
-    pub capabilities: ServerCapabilities,
+#[derive(Debug, Serialize)]
+struct RpcErrorBody {
+    code: i64,
+    message: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct Tool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Option<serde_json::Value>,
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
 
-#[derive(Debug)]
-pub struct ListToolsParams {}
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting default subscriber failed");
 
-#[derive(Debug)]
-pub struct ListToolsResult {
-    pub tools: Vec<Tool>,
-    pub next_cursor: Option<String>,
-}
+    print_banner();
 
-#[derive(Debug)]
-pub struct CallToolParams {
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
+    let state = AppState {
+        server_name: "mcp-http-server".to_string(),
+        server_version: "0.1.0".to_string(),
+    };
 
-#[derive(Debug)]
-pub struct ContentChunk {
-    pub text: String,
-}
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/mcp", post(handle_mcp))
+        .with_state(state);
 
-#[derive(Debug)]
-pub struct CallToolResult {
-    pub content: Vec<ContentChunk>,
-    pub is_error: Option<bool>,
-}
+    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    info!("listening on http://{}", addr);
 
-#[async_trait]
-pub trait McpService: Send + Sync {
-    async fn list_tools(&self, params: ListToolsParams) -> Result<ListToolsResult, anyhow::Error>;
-    async fn call_tool(&self, params: CallToolParams) -> Result<CallToolResult, anyhow::Error>;
-}
-
-/// MCP server for PCLI2 integration
-struct Pcli2McpService {
-    tools: HashMap<String, Tool>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Pcli2Args {
-    command: String,
-    subcommand: Option<String>,
-    args: Vec<String>,
-}
-
-impl Pcli2McpService {
-    fn new() -> Self {
-        let mut tools = HashMap::new();
-
-        // Define PCLI2 tools based on available commands with more explicit descriptions
-        tools.insert(
-            "pcli2_tenant".to_string(),
-            Tool {
-                name: "pcli2_tenant".to_string(),
-                description: Some("PCLI2 tool for managing tenants in Physna. Use this for all tenant-related operations.".to_string()),
-                input_schema: None,
-            },
-        );
-
-        tools.insert(
-            "pcli2_folder".to_string(),
-            Tool {
-                name: "pcli2_folder".to_string(),
-                description: Some("PCLI2 tool for managing folders in Physna. Use this to list, create, get, delete, or move folders in the Physna system. For listing folders, use the 'list' subcommand with --folder-path parameter.".to_string()),
-                input_schema: None,
-            },
-        );
-
-        tools.insert(
-            "pcli2_auth".to_string(),
-            Tool {
-                name: "pcli2_auth".to_string(),
-                description: Some("PCLI2 tool for authentication operations in Physna. Use this for login, logout, and token management.".to_string()),
-                input_schema: None,
-            },
-        );
-
-        tools.insert(
-            "pcli2_asset".to_string(),
-            Tool {
-                name: "pcli2_asset".to_string(),
-                description: Some("PCLI2 tool for managing assets in Physna. Use this for uploading, downloading, and managing assets.".to_string()),
-                input_schema: None,
-            },
-        );
-
-        tools.insert(
-            "pcli2_config".to_string(),
-            Tool {
-                name: "pcli2_config".to_string(),
-                description: Some("PCLI2 tool for configuration management in Physna. Use this to get, set, or list configuration settings.".to_string()),
-                input_schema: None,
-            },
-        );
-
-        Self { tools }
-    }
-}
-
-#[async_trait]
-impl McpService for Pcli2McpService {
-    async fn list_tools(&self, _params: ListToolsParams) -> Result<ListToolsResult, anyhow::Error> {
-        info!("Listing available PCLI2 tools");
-        let tools: Vec<Tool> = self.tools.values().cloned().collect();
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None
-        })
-    }
-
-    async fn call_tool(&self, params: CallToolParams) -> Result<CallToolResult, anyhow::Error> {
-        info!("Calling tool: {}", params.name);
-
-        // Parse the arguments based on the tool name
-        let mut cmd_args = Vec::new();
-
-        // Extract command from tool name (e.g., "pcli2_folder" -> "folder")
-        let command = params.name.strip_prefix("pcli2_").unwrap_or(&params.name);
-        cmd_args.push(command.to_string());
-
-        // Process the arguments based on the command type
-        if let Some(obj) = params.arguments.as_object() {
-            // Handle common arguments
-            if let Some(subcommand) = obj.get("subcommand").and_then(|v| v.as_str()) {
-                cmd_args.push(subcommand.to_string());
-            }
-
-            // Handle specific arguments based on the command
-            match command {
-                "folder" => {
-                    // Handle folder-specific arguments
-                    if let Some(folder_path) = obj.get("folder_path").and_then(|v| v.as_str()) {
-                        cmd_args.push("--folder-path".to_string());
-                        cmd_args.push(folder_path.to_string());
-                    } else if let Some(folder_uuid) = obj.get("folder_uuid").and_then(|v| v.as_str()) {
-                        cmd_args.push("--folder-uuid".to_string());
-                        cmd_args.push(folder_uuid.to_string());
-                    }
-
-                    // Add other common folder arguments
-                    if obj.contains_key("tenant") {
-                        if let Some(tenant) = obj.get("tenant").and_then(|v| v.as_str()) {
-                            cmd_args.push("-t".to_string());
-                            cmd_args.push(tenant.to_string());
-                        }
-                    }
-
-                    if obj.contains_key("format") {
-                        if let Some(format_val) = obj.get("format").and_then(|v| v.as_str()) {
-                            cmd_args.push("--format".to_string());
-                            cmd_args.push(format_val.to_string());
-                        }
-                    }
-
-                    // Check if it's a list command and add appropriate flags
-                    if obj.contains_key("list") || command == "folder" && (
-                        obj.contains_key("metadata") ||
-                        obj.contains_key("headers") ||
-                        obj.contains_key("pretty")
-                    ) {
-                        if obj.get("metadata").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            cmd_args.push("--metadata".to_string());
-                        }
-                        if obj.get("headers").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            cmd_args.push("--headers".to_string());
-                        }
-                        if obj.get("pretty").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            cmd_args.push("--pretty".to_string());
-                        }
-                    }
-                },
-                "asset" => {
-                    // Handle asset-specific arguments
-                    if let Some(asset_path) = obj.get("asset_path").and_then(|v| v.as_str()) {
-                        cmd_args.push("--asset-path".to_string());
-                        cmd_args.push(asset_path.to_string());
-                    }
-                },
-                "auth" => {
-                    // Handle auth-specific arguments
-                    if let Some(token) = obj.get("token").and_then(|v| v.as_str()) {
-                        cmd_args.push("--token".to_string());
-                        cmd_args.push(token.to_string());
-                    }
-                },
-                "config" => {
-                    // Handle config-specific arguments
-                    if let Some(key) = obj.get("key").and_then(|v| v.as_str()) {
-                        cmd_args.push(key.to_string());
-                    }
-                },
-                "tenant" => {
-                    // Handle tenant-specific arguments
-                    if let Some(tenant_id) = obj.get("tenant_id").and_then(|v| v.as_str()) {
-                        cmd_args.push(tenant_id.to_string());
-                    }
-                },
-                _ => {
-                    // For other commands, add all arguments as key-value pairs
-                    for (key, value) in obj {
-                        if key != "command" && key != "subcommand" {  // Skip command/subcommand as they're already handled
-                            cmd_args.push(format!("--{}", key));
-                            if let Some(str_val) = value.as_str() {
-                                cmd_args.push(str_val.to_string());
-                            } else if let Some(bool_val) = value.as_bool() {
-                                if bool_val {
-                                    // Boolean flags don't need a value when true
-                                    // We already added the flag above
-                                }
-                            } else if let Some(num_val) = value.as_number() {
-                                cmd_args.push(num_val.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // If arguments is not an object, treat it as a simple array of arguments
-            if let Some(arr) = params.arguments.as_array() {
-                for arg in arr {
-                    if let Some(arg_str) = arg.as_str() {
-                        cmd_args.push(arg_str.to_string());
-                    }
-                }
-            }
-        }
-
-        info!("Executing command: pcli2 {}", cmd_args.join(" "));
-
-        // Execute the PCLI2 command
-        let output = tokio::process::Command::new("pcli2")
-            .args(&cmd_args)
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to execute pcli2 command: {}", e))?;
-
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-        let result = if output.status.success() {
-            format!("PCLI2 Command Output:\n{}", stdout_str)
-        } else {
-            format!(
-                "PCLI2 Command Error:\n{}\nStderr:\n{}",
-                stdout_str, stderr_str
-            )
-        };
-
-        Ok(CallToolResult {
-            content: vec![ContentChunk {
-                text: result,
-            }],
-            is_error: Some(!output.status.success()),
-        })
-    }
-}
-
-// Simple MCP protocol implementation
-async fn serve_stdio(service: impl McpService + 'static) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use serde_json::{json, Value};
-
-    let stdin = stdin();
-    let mut stdout = stdout();
-    let reader = BufReader::new(stdin);
-
-    let mut lines = reader.lines();
-
-    info!("MCP server listening on stdio...");
-
-    // Process incoming lines
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        info!("Received line: {}", line);
-
-        // Parse the JSON-RPC message
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            if let Some(id) = value.get("id") {
-                if let Some(method) = value.get("method") {
-                    match method.as_str() {
-                        Some("initialize") => {
-                            info!("Processing initialize request");
-                            // Send initialization response with proper protocol version
-                            let response = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "protocolVersion": "2025-03-26",
-                                    "serverInfo": {
-                                        "name": "pcli2-mcp",
-                                        "version": "0.1.0"
-                                    },
-                                    "capabilities": {
-                                        "tools": {}
-                                    }
-                                }
-                            });
-
-                            let response_str = serde_json::to_string(&response)?;
-                            info!("Sending initialize response: {}", response_str);
-                            stdout.write_all(response_str.as_bytes()).await?;
-                            stdout.write_all(b"\n").await?;
-                            stdout.flush().await?;
-                            info!("Initialize response sent");
-                        }
-                        Some("initialized") => {
-                            // Respond to initialized notification
-                            info!("Client initialized");
-                        }
-                        Some("tools/list") => {
-                            // Handle tools/list request
-                            let tools_result = service.list_tools(ListToolsParams {}).await?;
-
-                            let tools_json: Vec<Value> = tools_result.tools.into_iter().map(|tool| {
-                                json!({
-                                    "name": tool.name,
-                                    "description": tool.description.unwrap_or_else(|| format!("PCLI2 tool for {}", tool.name)),
-                                    "inputSchema": tool.input_schema.unwrap_or_else(|| json!({
-                                        "type": "object",
-                                        "properties": {
-                                            "command": {
-                                                "type": "string",
-                                                "description": "The PCLI2 command to execute"
-                                            },
-                                            "subcommand": {
-                                                "type": "string",
-                                                "description": "The subcommand for the PCLI2 command"
-                                            },
-                                            "args": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "string"
-                                                },
-                                                "description": "Arguments for the command"
-                                            }
-                                        },
-                                        "required": ["command"]
-                                    }))
-                                })
-                            }).collect();
-
-                            let response = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "tools": tools_json
-                                }
-                            });
-
-                            let response_str = serde_json::to_string(&response)?;
-                            info!("Sending tools list response: {}", response_str);
-                            stdout.write_all(response_str.as_bytes()).await?;
-                            stdout.write_all(b"\n").await?;
-                            stdout.flush().await?;
-                        }
-                        Some(method_str) if method_str.starts_with("tools/") && method_str.contains("/call") => {
-                            // Extract tool name from method like "tools/{name}/call"
-                            let parts: Vec<&str> = method_str.split('/').collect();
-                            if parts.len() >= 3 && parts[2] == "call" {
-                                let tool_name = parts[1].to_string();
-
-                                // Get the parameters
-                                let arguments = if let Some(params) = value.get("params") {
-                                    if let Some(args) = params.get("arguments") {
-                                        args.clone()
-                                    } else {
-                                        json!({})
-                                    }
-                                } else {
-                                    json!({})
-                                };
-
-                                let call_params = CallToolParams {
-                                    name: tool_name,
-                                    arguments,
-                                };
-
-                                // Call the tool
-                                let result = service.call_tool(call_params).await?;
-
-                                let response = json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "content": result.content.iter().map(|chunk| {
-                                            json!({
-                                                "type": "text",
-                                                "text": chunk.text
-                                            })
-                                        }).collect::<Vec<_>>()
-                                    }
-                                });
-
-                                let response_str = serde_json::to_string(&response)?;
-                                stdout.write_all(format!("{}\n", response_str).as_bytes()).await?;
-                                stdout.flush().await?;
-                            }
-                        }
-                        _ => {
-                            // Send error response for unsupported methods
-                            let response = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "error": {
-                                    "code": -32601,
-                                    "message": format!("Method '{}' not found", method)
-                                }
-                            });
-
-                            let response_str = serde_json::to_string(&response)?;
-                            stdout.write_all(format!("{}\n", response_str).as_bytes()).await?;
-                            stdout.flush().await?;
-                        }
-                    }
-                }
-            } else if value.get("method").is_some() {
-                // This is a notification (no id)
-                if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
-                    match method {
-                        "shutdown" => {
-                            info!("Shutdown notification received");
-                            break;
-                        }
-                        _ => {
-                            info!("Unhandled notification: {}", method);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Invalid JSON
-            tracing::warn!("Invalid JSON received: {}", line);
-        }
-    }
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await?,
+        app.into_make_service(),
+    )
+    .await?;
 
     Ok(())
 }
 
-fn print_banner() {
-    use std::fmt::Write;
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
 
-    // Create a colorful ASCII art banner for PCLI2-MCP with warm gradient effect
-    let mut banner = String::new();
+async fn handle_mcp(
+    State(state): State<AppState>,
+    bytes: Bytes,
+) -> impl IntoResponse {
+    let request: RpcRequest = match serde_json::from_slice(&bytes) {
+        Ok(req) => req,
+        Err(_) => {
+            return json_error(
+                Value::Null,
+                -32700,
+                "Parse error: invalid JSON".to_string(),
+            )
+            .into_response();
+        }
+    };
 
-    // Define ANSI color codes for warm gradient effect (yellow to red)
-    let colors = [
-        "\x1b[38;5;226m", // Bright yellow
-        "\x1b[38;5;220m", // Orange-yellow
-        "\x1b[38;5;214m", // Orange
-        "\x1b[38;5;208m", // Orange-red
-        "\x1b[38;5;202m", // Red-orange
-        "\x1b[38;5;196m", // Bright red
+    let id = request.id.clone().unwrap_or(Value::Null);
+    if let Some(version) = request.jsonrpc.as_deref() {
+        if version != "2.0" {
+            return json_error(
+                id,
+                -32600,
+                format!("Invalid jsonrpc version '{}'", version),
+            )
+            .into_response();
+        }
+    }
+    if id.is_null() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    info!(
+        "mcp request: method={} id={}",
+        request.method,
+        id.to_string()
+    );
+
+    match request.method.as_str() {
+        "initialize" => {
+            debug!("initialize request");
+            let result = json!({
+                "protocolVersion": "2025-03-26",
+                "serverInfo": {
+                    "name": state.server_name,
+                    "version": state.server_version
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            });
+            json_ok(id, result).into_response()
+        }
+        "tools/list" => {
+            debug!("tools/list request");
+            let tools = tool_list();
+            let result = json!({ "tools": tools });
+            json_ok(id, result).into_response()
+        }
+        "tools/call" => {
+            let params = request.params.unwrap_or_else(|| json!({}));
+            debug!("tools/call request params={}", params);
+            match call_tool(params).await {
+                Ok(result) => json_ok(id, result).into_response(),
+                Err(message) => json_error(id, -32602, message).into_response(),
+            }
+        }
+        _ => json_error(
+            id,
+            -32601,
+            format!("Method '{}' not found", request.method),
+        )
+        .into_response(),
+    }
+}
+
+fn json_ok(id: Value, result: Value) -> Json<RpcResponse> {
+    Json(RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result,
+    })
+}
+
+fn json_error(id: Value, code: i64, message: String) -> Json<RpcErrorResponse> {
+    Json(RpcErrorResponse {
+        jsonrpc: "2.0",
+        id,
+        error: RpcErrorBody { code, message },
+    })
+}
+
+fn tool_list() -> Vec<Value> {
+    debug!("building tool list");
+    vec![
+        json!({
+            "name": "pcli2",
+            "description": "Physna Command Line Interface v2 (PCLI2). Runs `pcli2 folder list` or `pcli2 asset list` with the provided options.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "resource": { "type": "string", "enum": ["folder", "asset"], "description": "Resource to list. Defaults to folder." },
+                    "tenant": { "type": "string", "description": "Tenant ID or alias." },
+                    "metadata": { "type": "boolean", "description": "Include metadata in output." },
+                    "headers": { "type": "boolean", "description": "Include headers in output." },
+                    "pretty": { "type": "boolean", "description": "Pretty output." },
+                    "format": { "type": "string", "enum": ["json", "csv", "tree"], "description": "Output format." },
+                    "folder_uuid": { "type": "string", "description": "Folder UUID." },
+                    "folder_path": { "type": "string", "description": "Folder path, e.g. /Root/Child." },
+                    "reload": { "type": "boolean", "description": "Reload folder cache from server." }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "pcli2_geometric_match",
+            "description": "Physna Command Line Interface v2 (PCLI2). Runs `pcli2 asset geometric-match` with the provided options.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string", "description": "Tenant ID or alias." },
+                    "uuid": { "type": "string", "description": "Resource UUID." },
+                    "path": { "type": "string", "description": "Resource path, e.g. /Root/Folder/Asset.stl." },
+                    "threshold": { "type": "number", "description": "Similarity threshold (0.00 to 100.00). Default 80.0." },
+                    "headers": { "type": "boolean", "description": "Include headers in output." },
+                    "metadata": { "type": "boolean", "description": "Include metadata in output." },
+                    "pretty": { "type": "boolean", "description": "Pretty output." },
+                    "format": { "type": "string", "enum": ["json", "csv"], "description": "Output format." }
+                },
+                "required": []
+            }
+        }),
+    ]
+}
+
+async fn call_tool(params: Value) -> Result<Value, String> {
+    debug!("call_tool params={}", params);
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing tool name".to_string())?;
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+
+    match name {
+        "pcli2" => {
+            debug!("dispatching pcli2 list");
+            let output = run_pcli2_list(args).await?;
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": output
+                }]
+            }))
+        }
+        "pcli2_geometric_match" => {
+            debug!("dispatching pcli2 asset geometric-match");
+            let output = run_pcli2_asset_geometric_match(args).await?;
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": output
+                }]
+            }))
+        }
+        _ => Err(format!("Unknown tool '{}'", name)),
+    }
+}
+
+async fn run_pcli2_list(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_list args={}", args);
+    let resource = args
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("folder");
+    let mut cmd_args: Vec<String> = vec![resource.to_string(), "list".to_string()];
+
+    if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
+        cmd_args.push("-t".to_string());
+        cmd_args.push(tenant.to_string());
+    }
+    if args.get("metadata").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--metadata".to_string());
+    }
+    if args.get("headers").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--headers".to_string());
+    }
+    if args.get("pretty").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--pretty".to_string());
+    }
+    if let Some(format) = args.get("format").and_then(|v| v.as_str()) {
+        cmd_args.push("-f".to_string());
+        cmd_args.push(format.to_string());
+    }
+    if let Some(folder_uuid) = args.get("folder_uuid").and_then(|v| v.as_str()) {
+        cmd_args.push("--folder-uuid".to_string());
+        cmd_args.push(folder_uuid.to_string());
+    }
+    if let Some(folder_path) = args.get("folder_path").and_then(|v| v.as_str()) {
+        cmd_args.push("--folder-path".to_string());
+        cmd_args.push(folder_path.to_string());
+    }
+    if args.get("reload").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--reload".to_string());
+    }
+
+    info!("executing: pcli2 {}", cmd_args.join(" "));
+    let output = tokio::process::Command::new("pcli2")
+        .args(&cmd_args)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute pcli2: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        Ok(stdout.trim_end().to_string())
+    } else {
+        Err(format!(
+            "pcli2 {} list failed (code {}):\n{}\n{}",
+            resource,
+            output.status,
+            stdout.trim_end(),
+            stderr.trim_end()
+        ))
+    }
+}
+
+async fn run_pcli2_asset_geometric_match(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_asset_geometric_match args={}", args);
+    let mut cmd_args: Vec<String> = vec![
+        "asset".to_string(),
+        "geometric-match".to_string(),
     ];
 
-    let ascii_lines = [
+    if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
+        cmd_args.push("-t".to_string());
+        cmd_args.push(tenant.to_string());
+    }
+
+    let has_uuid = args.get("uuid").and_then(|v| v.as_str()).is_some();
+    let has_path = args.get("path").and_then(|v| v.as_str()).is_some();
+    if !has_uuid && !has_path {
+        return Err("Missing required argument: provide either 'uuid' or 'path'".to_string());
+    }
+
+    if let Some(uuid) = args.get("uuid").and_then(|v| v.as_str()) {
+        cmd_args.push("--uuid".to_string());
+        cmd_args.push(uuid.to_string());
+    }
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        cmd_args.push("--path".to_string());
+        cmd_args.push(path.to_string());
+    }
+    if let Some(threshold) = args.get("threshold").and_then(|v| v.as_f64()) {
+        cmd_args.push("--threshold".to_string());
+        cmd_args.push(threshold.to_string());
+    }
+    if args.get("headers").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--headers".to_string());
+    }
+    if args.get("metadata").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--metadata".to_string());
+    }
+    if args.get("pretty").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd_args.push("--pretty".to_string());
+    }
+    if let Some(format) = args.get("format").and_then(|v| v.as_str()) {
+        cmd_args.push("-f".to_string());
+        cmd_args.push(format.to_string());
+    }
+
+    info!("executing: pcli2 {}", cmd_args.join(" "));
+    let output = tokio::process::Command::new("pcli2")
+        .args(&cmd_args)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute pcli2: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        Ok(stdout.trim_end().to_string())
+    } else {
+        Err(format!(
+            "pcli2 asset geometric-match failed (code {}):\n{}\n{}",
+            output.status,
+            stdout.trim_end(),
+            stderr.trim_end()
+        ))
+    }
+}
+
+fn print_banner() {
+    let ascii = [
         "██████╗  ██████╗██╗     ██╗██████╗     ███╗   ███╗ ██████╗██████╗ ",
         "██╔══██╗██╔════╝██║     ██║╚════██╗    ████╗ ████║██╔════╝██╔══██╗",
         "██████╔╝██║     ██║     ██║ █████╔╝    ██╔████╔██║██║     ██████╔╝",
@@ -526,60 +400,42 @@ fn print_banner() {
         "╚═╝      ╚═════╝╚══════╝╚═╝╚══════╝    ╚═╝     ╚═╝ ╚═════╝╚═╝     ",
     ];
 
-    // Print each line with warm gradient coloring (vertical gradient by row)
-    for (line_idx, line) in ascii_lines.iter().enumerate() {
-        let color_idx = line_idx % colors.len();
-        let color = colors[color_idx];
-
-        for ch in line.chars() {
-            write!(banner, "{}{}", color, ch).unwrap();
-        }
-        writeln!(banner).unwrap();
+    for line in ascii {
+        println!("{}", gradient_line(line));
     }
-
-    // Reset color and add the uncolored subtitle
-    banner.push_str("\x1b[0m");
-    banner.push_str("                                                                \n");
-    banner.push_str("                   MCP Server for PCLI2 Integration             \n");
-
-    println!("{}", banner);
-
-    // Additional info with some color - properly aligned
-    println!("\x1b[36m┌─────────────────────────────────────────────────────────────┐\x1b[0m"); // Cyan
-    println!("\x1b[36m│\x1b[0m  \x1b[92mConnecting PCLI2 with Local Ollama                      \x1b[0m  \x1b[36m│\x1b[0m"); // Green text
-    println!("\x1b[36m│\x1b[0m  \x1b[94mvia Model Context Protocol (MCP)                        \x1b[0m  \x1b[36m│\x1b[0m"); // Blue text
-    println!("\x1b[36m│\x1b[0m  \x1b[93mConnection: stdio                                       \x1b[0m  \x1b[36m│\x1b[0m"); // Yellow text
-    println!("\x1b[36m└─────────────────────────────────────────────────────────────┘\x1b[0m"); // Cyan
+    println!("{}", gradient_line("          Model Context Protocol Server over HTTP          "));
     println!();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+fn gradient_line(line: &str) -> String {
+    let start = (36u8, 144u8, 255u8);
+    let end = (255u8, 120u8, 48u8);
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len().max(1);
+    let mut out = String::new();
 
-    // Setup logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(if args.verbose { Level::DEBUG } else { Level::INFO })
-        .finish();
+    for (i, ch) in chars.iter().enumerate() {
+        let t = if len == 1 {
+            0.0
+        } else {
+            i as f32 / (len - 1) as f32
+        };
+        let r = lerp(start.0, end.0, t);
+        let g = lerp(start.1, end.1, t);
+        let b = lerp(start.2, end.2, t);
+        out.push_str(&format!("\x1b[38;2;{};{};{}m{}", r, g, b, ch));
+    }
+    out.push_str("\x1b[0m");
+    out
+}
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default subscriber failed");
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    let af = a as f32;
+    let bf = b as f32;
+    (af + (bf - af) * t) as u8
+}
 
-    // Print banner
-    print_banner();
-
-    info!("Starting PCLI2 MCP Server...");
-
-    // Create the service
-    let service = Pcli2McpService::new();
-
-    // Print service info
-    info!("Available tools: {:?}", service.tools.keys());
-
-    // Start the stdio server
-    serve_stdio(service).await?;
-
-    info!("PCLI2 MCP Server stopped.");
-
-    Ok(())
+#[cfg(test)]
+mod tests {
+    // Tests removed: SQLite support was removed.
 }

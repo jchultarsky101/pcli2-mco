@@ -5,14 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-async-trait = "0.1.89"
+axum = "0.7.9"
 clap = { version = "4.5.55", features = ["derive"] }
-futures = "0.3.31"
-rmcp = { version = "0.14.0", features = ["server", "macros", "transport-io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }
-tokio-util = "0.7.18"
 tracing = "0.1.44"
-tracing-subscriber = "0.3.18"
-tui-banner = "0.2.3"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

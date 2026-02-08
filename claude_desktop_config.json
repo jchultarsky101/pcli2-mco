@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pcli2": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://localhost:8080/mcp"
+      ]
+    }
+  }
+}
