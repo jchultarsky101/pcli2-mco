@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::State,
@@ -7,21 +7,37 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::Parser;
+use clap::{value_parser, Arg, ArgMatches, Command};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-#[derive(Parser, Debug)]
-#[command(name = "mcp-http-server")]
-#[command(about = "A simple MCP server over HTTP")]
-struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 8080)]
-    port: u16,
-}
+const APP_NAME: &str = env!("CARGO_PKG_NAME");
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_ABOUT: &str = "A simple MCP server over HTTP";
+
+const SERVER_NAME: &str = "mcp-http-server";
+
+const CMD_SERVE: &str = "serve";
+const CMD_CONFIG: &str = "config";
+const CMD_HELP: &str = "help";
+
+const ARG_PORT: &str = "port";
+const ARG_CLIENT: &str = "client";
+const ARG_COMMAND: &str = "command";
+
+const DEFAULT_PORT_STR: &str = "8080";
+const DEFAULT_HOST: &str = "localhost";
+
+const CLIENT_CLAUDE: &str = "claude";
+const CLIENT_QWEN_CODE: &str = "qwen-code";
+const CLIENT_QWEN_AGENT: &str = "qwen-agent";
+
+const MCP_SERVER_ALIAS: &str = "pcli2";
+const MCP_REMOTE_COMMAND: &str = "npx";
+const MCP_REMOTE_PACKAGE: &str = "mcp-remote";
 
 #[derive(Clone)]
 struct AppState {
@@ -59,8 +75,18 @@ struct RpcErrorBody {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    init_logging();
+    let matches = build_cli().get_matches();
 
+    match matches.subcommand() {
+        Some((CMD_SERVE, sub_matches)) => run_server(sub_matches).await,
+        Some((CMD_CONFIG, sub_matches)) => run_config(sub_matches),
+        Some((CMD_HELP, sub_matches)) => run_help(sub_matches),
+        _ => Ok(()),
+    }
+}
+
+fn init_logging() {
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
@@ -68,12 +94,78 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)
         .expect("setting default subscriber failed");
+}
+
+fn build_cli() -> Command {
+    Command::new(APP_NAME)
+        .version(APP_VERSION)
+        .about(APP_ABOUT)
+        .arg_required_else_help(true)
+        .subcommand_required(true)
+        .disable_help_subcommand(true)
+        .subcommand(serve_command())
+        .subcommand(config_command())
+        .subcommand(help_command())
+}
+
+fn serve_command() -> Command {
+    Command::new(CMD_SERVE)
+        .about("Run the MCP server")
+        .arg(
+            Arg::new(ARG_PORT)
+                .short('p')
+                .long("port")
+                .value_name("PORT")
+                .value_parser(value_parser!(u16))
+                .default_value(DEFAULT_PORT_STR)
+                .help("Port to listen on"),
+        )
+}
+
+fn config_command() -> Command {
+    Command::new(CMD_CONFIG)
+        .about("Print JSON config for MCP clients")
+        .arg(
+            Arg::new(ARG_CLIENT)
+                .long("client")
+                .value_name("CLIENT")
+                .value_parser([CLIENT_CLAUDE, CLIENT_QWEN_CODE, CLIENT_QWEN_AGENT])
+                .default_value(CLIENT_CLAUDE)
+                .help("Target client config to render"),
+        )
+        .arg(
+            Arg::new(ARG_PORT)
+                .short('p')
+                .long("port")
+                .value_name("PORT")
+                .value_parser(value_parser!(u16))
+                .default_value(DEFAULT_PORT_STR)
+                .help("Port the local server will listen on"),
+        )
+}
+
+fn help_command() -> Command {
+    Command::new(CMD_HELP)
+        .about("Print help for a command")
+        .arg(
+            Arg::new(ARG_COMMAND)
+                .value_name("COMMAND")
+                .required(false)
+                .value_parser([CMD_SERVE, CMD_CONFIG, CMD_HELP])
+                .help("Command to show help for"),
+        )
+}
+
+async fn run_server(matches: &ArgMatches) -> Result<()> {
+    let port = *matches
+        .get_one::<u16>(ARG_PORT)
+        .ok_or_else(|| anyhow!("missing port"))?;
 
     print_banner();
 
     let state = AppState {
-        server_name: "mcp-http-server".to_string(),
-        server_version: "0.1.0".to_string(),
+        server_name: SERVER_NAME.to_string(),
+        server_version: APP_VERSION.to_string(),
     };
 
     let app = Router::new()
@@ -81,7 +173,7 @@ async fn main() -> Result<()> {
         .route("/mcp", post(handle_mcp))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on http://{}", addr);
 
     axum::serve(
@@ -91,6 +183,65 @@ async fn main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn run_config(matches: &ArgMatches) -> Result<()> {
+    let client = matches
+        .get_one::<String>(ARG_CLIENT)
+        .map(String::as_str)
+        .unwrap_or(CLIENT_CLAUDE);
+    let port = *matches
+        .get_one::<u16>(ARG_PORT)
+        .ok_or_else(|| anyhow!("missing port"))?;
+
+    let config = build_client_config(client, port)?;
+    let output = serde_json::to_string_pretty(&config)?;
+    println!("{}", output);
+    Ok(())
+}
+
+fn run_help(matches: &ArgMatches) -> Result<()> {
+    let target = matches.get_one::<String>(ARG_COMMAND).map(String::as_str);
+    let mut cmd = build_cli();
+
+    if let Some(name) = target {
+        if let Some(sub) = cmd
+            .get_subcommands()
+            .find(|sub| sub.get_name() == name)
+        {
+            let mut sub_cmd = sub.clone();
+            sub_cmd.print_help()?;
+            println!();
+            return Ok(());
+        }
+        return Err(anyhow!("Unknown command '{}'", name));
+    }
+
+    cmd.print_help()?;
+    println!();
+    Ok(())
+}
+
+fn build_client_config(client: &str, port: u16) -> Result<Value> {
+    let server_entry = json!({
+        MCP_SERVER_ALIAS: {
+            "command": MCP_REMOTE_COMMAND,
+            "args": [
+                "-y",
+                MCP_REMOTE_PACKAGE,
+                format!("http://{}:{}/mcp", DEFAULT_HOST, port)
+            ]
+        }
+    });
+
+    let config = match client {
+        CLIENT_CLAUDE | CLIENT_QWEN_CODE | CLIENT_QWEN_AGENT => {
+            json!({ "mcpServers": server_entry })
+        }
+        _ => return Err(anyhow!("Unsupported client '{}'", client)),
+    };
+
+    Ok(config)
 }
 
 async fn health() -> impl IntoResponse {
@@ -403,7 +554,7 @@ fn print_banner() {
     for line in ascii {
         println!("{}", gradient_line(line));
     }
-    println!("{}", gradient_line("          Model Context Protocol Server over HTTP          "));
+    println!("{}", gradient_line("          Model Context Protocol Server for PCLI2           "));
     println!();
 }
 

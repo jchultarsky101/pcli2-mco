@@ -8,7 +8,16 @@ A lightweight Model Context Protocol (MCP) server over HTTP that wraps the PCLI2
 It exposes PCLI2 capabilities as MCP tools so LLM clients can list assets/folders
 and run geometric match queries through a single JSON-RPC endpoint.
 
+Project links:
+
+- `pcli2-mcp`: https://github.com/jchultarsky101/pcli2-mco
+- `pcli2`: https://github.com/jchultarsky101/pcli2
+
 **Status:** early development (v0.1.0).
+
+## Relationship To PCLI2
+
+PCLI2 (Physna Command Line Interface v2) is the official CLI for the Physna public API, focused on 3D geometry search and asset/folder operations. This project is an MCP wrapper around PCLI2: it runs PCLI2 commands behind an MCP JSON-RPC interface so clients like Claude or Qwen can invoke the same capabilities programmatically. For PCLI2 documentation and usage, see the PCLI2 docs site: https://jchultarsky101.github.io/pcli2/ and the repository: https://github.com/jchultarsky101/pcli2.
 
 ## Features
 
@@ -34,13 +43,33 @@ The binary will be at `target/release/pcli2-mcp`.
 ## Run
 
 ```bash
-cargo run -- --port 8080
+cargo run -- serve --port 8080
 ```
 
 Health check:
 
 ```bash
 curl -s http://localhost:8080/health
+```
+
+## CLI
+
+Run the server:
+
+```bash
+pcli2-mcp serve --port 8080
+```
+
+Print client config (pretty JSON):
+
+```bash
+pcli2-mcp config --client claude --port 8080
+```
+
+Command-specific help:
+
+```bash
+pcli2-mcp help serve
 ```
 
 ## MCP API
