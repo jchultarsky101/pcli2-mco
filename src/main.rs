@@ -378,6 +378,71 @@ fn tool_list() -> Vec<Value> {
     }));
 
     tools.push(json!({
+        "name": "pcli2_version",
+        "description": "Runs `pcli2 --version`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "pcli2_config_get",
+        "description": "Runs `pcli2 config get`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "headers": { "type": "boolean", "description": "Include headers in output." },
+                "pretty": { "type": "boolean", "description": "Pretty output." },
+                "format": { "type": "string", "enum": ["json", "csv", "tree"], "description": "Output format." }
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "pcli2_config_get_path",
+        "description": "Runs `pcli2 config get path`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "format": { "type": "string", "enum": ["json", "csv", "tree"], "description": "Output format." }
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "pcli2_config_environment_list",
+        "description": "Runs `pcli2 config environment list`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "headers": { "type": "boolean", "description": "Include headers in output." },
+                "pretty": { "type": "boolean", "description": "Pretty output." },
+                "format": { "type": "string", "enum": ["json", "csv"], "description": "Output format." }
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
+        "name": "pcli2_config_environment_get",
+        "description": "Runs `pcli2 config environment get`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Environment name (defaults to active environment)." },
+                "headers": { "type": "boolean", "description": "Include headers in output." },
+                "pretty": { "type": "boolean", "description": "Pretty output." },
+                "format": { "type": "string", "enum": ["json", "csv"], "description": "Output format." }
+            },
+            "required": []
+        }
+    }));
+
+    tools.push(json!({
         "name": "pcli2_tenant_get",
         "description": "Runs `pcli2 tenant get` (current tenant).",
         "inputSchema": {
@@ -740,6 +805,11 @@ async fn call_tool(params: Value) -> Result<Value, String> {
             }))
         }
         "pcli2_tenant_list" => run_simple_tool("pcli2 tenant list", run_pcli2_tenant_list(args).await),
+        "pcli2_version" => run_simple_tool("pcli2 --version", run_pcli2_version().await),
+        "pcli2_config_get" => run_simple_tool("pcli2 config get", run_pcli2_config_get(args).await),
+        "pcli2_config_get_path" => run_simple_tool("pcli2 config get path", run_pcli2_config_get_path(args).await),
+        "pcli2_config_environment_list" => run_simple_tool("pcli2 config environment list", run_pcli2_config_environment_list(args).await),
+        "pcli2_config_environment_get" => run_simple_tool("pcli2 config environment get", run_pcli2_config_environment_get(args).await),
         "pcli2_tenant_get" => run_simple_tool("pcli2 tenant get", run_pcli2_tenant_get(args).await),
         "pcli2_tenant_state" => run_simple_tool("pcli2 tenant state", run_pcli2_tenant_state(args).await),
         "pcli2_folder_get" => run_simple_tool("pcli2 folder get", run_pcli2_folder_get(args).await),
@@ -854,6 +924,55 @@ async fn run_pcli2_tenant_list(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
     push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
     run_pcli2_command(cmd_args, "pcli2 tenant list").await
+}
+
+async fn run_pcli2_version() -> Result<String, String> {
+    debug!("run_pcli2_version");
+    let cmd_args: Vec<String> = vec!["--version".to_string()];
+    run_pcli2_command(cmd_args, "pcli2 --version").await
+}
+
+async fn run_pcli2_config_get(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_config_get args={}", args);
+    let mut cmd_args: Vec<String> = vec!["config".to_string(), "get".to_string()];
+    push_flag_if(&mut cmd_args, &args, "headers", "--headers");
+    push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
+    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    run_pcli2_command(cmd_args, "pcli2 config get").await
+}
+
+async fn run_pcli2_config_get_path(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_config_get_path args={}", args);
+    let mut cmd_args: Vec<String> = vec!["config".to_string(), "get".to_string(), "path".to_string()];
+    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    run_pcli2_command(cmd_args, "pcli2 config get path").await
+}
+
+async fn run_pcli2_config_environment_list(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_config_environment_list args={}", args);
+    let mut cmd_args: Vec<String> = vec![
+        "config".to_string(),
+        "environment".to_string(),
+        "list".to_string(),
+    ];
+    push_flag_if(&mut cmd_args, &args, "headers", "--headers");
+    push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
+    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    run_pcli2_command(cmd_args, "pcli2 config environment list").await
+}
+
+async fn run_pcli2_config_environment_get(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_config_environment_get args={}", args);
+    let mut cmd_args: Vec<String> = vec![
+        "config".to_string(),
+        "environment".to_string(),
+        "get".to_string(),
+    ];
+    push_opt_string(&mut cmd_args, "-n", args.get("name").and_then(|v| v.as_str()));
+    push_flag_if(&mut cmd_args, &args, "headers", "--headers");
+    push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
+    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    run_pcli2_command(cmd_args, "pcli2 config environment get").await
 }
 
 async fn run_pcli2_tenant_get(args: Value) -> Result<String, String> {
