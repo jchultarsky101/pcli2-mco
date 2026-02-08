@@ -72,6 +72,68 @@ Command-specific help:
 pcli2-mcp help serve
 ```
 
+## Client Setup (Using `config`)
+
+The `config` command prints a ready-to-paste JSON snippet with the MCP server definition:
+
+```bash
+pcli2-mcp config --client claude --port 8080
+```
+
+Use the output in the sections below.
+
+### Claude Desktop
+
+1. Open Claude Desktop and go to Settings > Developer > Edit Config (or open the config file directly).
+2. Paste the JSON output under `mcpServers`.
+3. Restart Claude Desktop.
+
+Config file locations:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+### Qwen Code
+
+Qwen Code reads MCP servers from `mcpServers` in `settings.json`. You can configure this via:
+
+1. Edit `.qwen/settings.json` in your project, or `~/.qwen/settings.json` for user scope.
+2. Paste the JSON output under `mcpServers`.
+3. Restart Qwen Code for the settings to load.
+
+Alternatively, you can add a server with the CLI:
+
+```bash
+qwen mcp add --transport http pcli2 http://localhost:8080/mcp
+```
+
+### Qwen Agent (Python)
+
+Pass an MCP configuration dictionary (including `mcpServers`) when creating the agent:
+
+```python
+from qwen_agent.agents import Assistant
+
+mcp_config = {
+    "mcpServers": {
+        "pcli2": {
+            "command": "npx",
+            "args": ["-y", "mcp-remote", "http://localhost:8080/mcp"]
+        }
+    }
+}
+
+agent = Assistant(
+    llm=llm_cfg,
+    function_list=[mcp_config],
+)
+```
+
+### Other MCP Clients
+
+Most MCP-compatible clients accept the same `mcpServers` JSON block. Use the output of `pcli2-mcp config` as the server definition and follow your client’s MCP documentation.
+
 ## MCP API
 
 The server implements MCP over HTTP with a JSON-RPC 2.0 interface.
