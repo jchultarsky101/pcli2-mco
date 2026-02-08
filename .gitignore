@@ -2,3 +2,7 @@
 **/*.rs.bk
 /dist/
 /target/dist/
+.DS_Store
+*.log
+.idea/
+.vscode/
