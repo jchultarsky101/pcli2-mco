@@ -186,7 +186,7 @@ Notes:
 | `pcli2_tenant_list` | `pcli2 tenant list` | none |
 | `pcli2_tenant_get` | `pcli2 tenant get` | none |
 | `pcli2_tenant_state` | `pcli2 tenant state` | none |
-| `pcli2_tenant_use` | `pcli2 tenant use` | `name` |
+| `pcli2_tenant_use` | `pcli2 tenant use --name <tenantName>` | `tenant_name` or `name` |
 | `pcli2_config_get` | `pcli2 config get` | none |
 | `pcli2_config_get_path` | `pcli2 config get path` | none |
 | `pcli2_config_environment_list` | `pcli2 config environment list` | none |
