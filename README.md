@@ -13,7 +13,7 @@ Project links:
 - `pcli2-mcp`: https://github.com/jchultarsky101/pcli2-mco
 - `pcli2`: https://github.com/jchultarsky101/pcli2
 
-**Status:** early development (v0.1.0).
+**Status:** early development (v0.1.2).
 
 ## Relationship To PCLI2
 
@@ -57,13 +57,13 @@ curl -s http://localhost:8080/health
 Run the server:
 
 ```bash
-pcli2-mcp serve --port 8080
+pcli2-mcp serve --port 8080 --log-level info
 ```
 
 Print client config (pretty JSON):
 
 ```bash
-pcli2-mcp config --client claude --port 8080
+pcli2-mcp config --client claude --host localhost --port 8080
 ```
 
 Command-specific help:
@@ -77,7 +77,7 @@ pcli2-mcp help serve
 The `config` command prints a ready-to-paste JSON snippet with the MCP server definition:
 
 ```bash
-pcli2-mcp config --client claude --port 8080
+pcli2-mcp config --client claude --host localhost --port 8080
 ```
 
 Use the output in the sections below.
@@ -173,36 +173,37 @@ Example `tools/call` (list assets under `/Julian` as CSV):
 
 ## Tools
 
-### `pcli2`
+Notes:
 
-Runs `pcli2 folder list` (default) or `pcli2 asset list`.
+- Most asset tools require either `uuid` or `path`.
+- Most folder tools require either `folder_uuid` or `folder_path` (or a list of `folder_path`).
 
-Arguments:
-
-- `resource`: `folder` or `asset` (default: `folder`)
-- `tenant`: tenant ID or alias
-- `metadata`: include metadata
-- `headers`: include headers
-- `pretty`: pretty output
-- `format`: `json`, `csv`, or `tree`
-- `folder_uuid`: folder UUID
-- `folder_path`: folder path (e.g. `/Root/Child`)
-- `reload`: reload folder cache
-
-### `pcli2_geometric_match`
-
-Runs `pcli2 asset geometric-match`.
-
-Arguments:
-
-- `tenant`: tenant ID or alias
-- `uuid`: resource UUID (required if `path` not provided)
-- `path`: resource path (required if `uuid` not provided)
-- `threshold`: similarity threshold (0.00–100.00)
-- `headers`: include headers
-- `metadata`: include metadata
-- `pretty`: pretty output
-- `format`: `json` or `csv`
+| Tool | PCLI2 Command | Required Arguments |
+| --- | --- | --- |
+| `pcli2` | `pcli2 folder list` / `pcli2 asset list` | none |
+| `pcli2_version` | `pcli2 --version` | none |
+| `pcli2_tenant_list` | `pcli2 tenant list` | none |
+| `pcli2_tenant_get` | `pcli2 tenant get` | none |
+| `pcli2_tenant_state` | `pcli2 tenant state` | none |
+| `pcli2_tenant_use` | `pcli2 tenant use` | `name` |
+| `pcli2_config_get` | `pcli2 config get` | none |
+| `pcli2_config_get_path` | `pcli2 config get path` | none |
+| `pcli2_config_environment_list` | `pcli2 config environment list` | none |
+| `pcli2_config_environment_get` | `pcli2 config environment get` | none |
+| `pcli2_folder_get` | `pcli2 folder get` | `folder_uuid` or `folder_path` |
+| `pcli2_folder_resolve` | `pcli2 folder resolve` | `folder_path` |
+| `pcli2_folder_dependencies` | `pcli2 folder dependencies` | `folder_path` |
+| `pcli2_folder_geometric_match` | `pcli2 folder geometric-match` | `folder_path` |
+| `pcli2_folder_part_match` | `pcli2 folder part-match` | `folder_path` |
+| `pcli2_folder_visual_match` | `pcli2 folder visual-match` | `folder_path` |
+| `pcli2_asset_get` | `pcli2 asset get` | `uuid` or `path` |
+| `pcli2_asset_dependencies` | `pcli2 asset dependencies` | `uuid` or `path` |
+| `pcli2_asset_thumbnail` | `pcli2 asset thumbnail` | `uuid` or `path` |
+| `pcli2_geometric_match` | `pcli2 asset geometric-match` | `uuid` or `path` |
+| `pcli2_asset_part_match` | `pcli2 asset part-match` | `uuid` or `path` |
+| `pcli2_asset_visual_match` | `pcli2 asset visual-match` | `uuid` or `path` |
+| `pcli2_asset_text_match` | `pcli2 asset text-match` | `text` |
+| `pcli2_asset_metadata_create` | `pcli2 asset metadata create` | `name`, `value`, plus `uuid` or `path` |
 
 Example:
 
@@ -226,6 +227,7 @@ Example:
 ## Configuration
 
 - `--port`: listening port (default: `8080`)
+- `--log-level`: logging level for the server (default: `info`)
 - `RUST_LOG`: log level (e.g. `info`, `debug`)
 
 ## Troubleshooting
