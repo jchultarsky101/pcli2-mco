@@ -8,9 +8,41 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Added
 
-- README with usage, API examples, and tool documentation.
-- Apache 2.0 license.
-- Changelog following Keep a Changelog format.
+- Support for additional PCLI2 tools (tenant, config/environment, folder, asset, metadata).
+- CLI improvements: `serve --log-level` and `config --host`.
+- Mock `pcli2` integration test for tool wiring.
+- Expanded README with client setup instructions and tool reference table.
+
+### Changed
+
+- Tool schema construction refactored for reuse and consistency.
+- Removed folder thumbnail tool and asset download support.
+
+## [0.1.2] - 2026-02-09
+
+### Added
+
+- Support for additional PCLI2 tools (tenant, config/environment, folder, asset, metadata).
+- CLI improvements: `serve --log-level` and `config --host`.
+- Mock `pcli2` integration test for tool wiring.
+- Expanded README with client setup instructions and tool reference table.
+
+### Changed
+
+- Tool schema construction refactored for reuse and consistency.
+- Removed folder thumbnail tool and asset download support.
+
+## [0.1.1] - 2026-02-08
+
+### Added
+
+- Badges and NOTICE file.
+- GitHub Actions CI and cargo-dist release workflow.
+- README improvements and client setup instructions.
+
+### Changed
+
+- Remote repository renamed to `pcli2-mcp`.
 
 ## [0.1.0] - 2026-02-08
 
