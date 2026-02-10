@@ -7,10 +7,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use clap::{value_parser, Arg, ArgMatches, Command};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::env;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -508,14 +514,6 @@ fn add_concurrent(props: &mut Props) {
     );
 }
 
-fn add_file(props: &mut Props) {
-    add_prop(
-        props,
-        "file",
-        json!({ "type": "string", "description": "Output file path." }),
-    );
-}
-
 fn add_text(props: &mut Props) {
     add_prop(
         props,
@@ -814,11 +812,10 @@ fn tool_list() -> Vec<Value> {
     let mut props = Props::new();
     add_tenant(&mut props);
     add_uuid_path(&mut props);
-    add_file(&mut props);
     push_tool(
         &mut tools,
         "pcli2_asset_thumbnail",
-        "Runs `pcli2 asset thumbnail`.",
+        "Runs `pcli2 asset thumbnail` and returns a base64-encoded PNG.",
         props,
         &[],
     );
@@ -942,7 +939,24 @@ async fn call_tool(params: Value) -> Result<Value, String> {
         "pcli2_folder_visual_match" => run_simple_tool("pcli2 folder visual-match", run_pcli2_folder_visual_match(args).await),
         "pcli2_asset_get" => run_simple_tool("pcli2 asset get", run_pcli2_asset_get(args).await),
         "pcli2_asset_dependencies" => run_simple_tool("pcli2 asset dependencies", run_pcli2_asset_dependencies(args).await),
-        "pcli2_asset_thumbnail" => run_simple_tool("pcli2 asset thumbnail", run_pcli2_asset_thumbnail(args).await),
+        "pcli2_asset_thumbnail" => {
+            debug!("dispatching pcli2 asset thumbnail");
+            let encoded = run_pcli2_asset_thumbnail(args).await?;
+            let data_url = format!("data:image/png;base64,{}", encoded);
+            Ok(json!({
+                "content": [{
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "annotations": {
+                        "audience": ["user"]
+                    },
+                    "data": encoded
+                }, {
+                    "type": "text",
+                    "text": data_url
+                }]
+            }))
+        }
         "pcli2_asset_reprocess" => run_simple_tool("pcli2 asset reprocess", run_pcli2_asset_reprocess(args).await),
         "pcli2_geometric_match" => {
             debug!("dispatching pcli2 asset geometric-match");
@@ -1313,10 +1327,22 @@ async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
     let (uuid, path) = require_uuid_or_path(&args)?;
     push_opt_string(&mut cmd_args, "--uuid", uuid.as_deref());
     push_opt_string(&mut cmd_args, "--path", path.as_deref());
-    if let Some(file) = args.get("file").and_then(|v| v.as_str()) {
-        cmd_args.push(file.to_string());
+    let temp_path = temp_thumbnail_path()?;
+    let temp_path_str = temp_path
+        .to_str()
+        .ok_or_else(|| "Failed to build temporary thumbnail path".to_string())?;
+    push_opt_string(&mut cmd_args, "--file", Some(temp_path_str));
+    run_pcli2_command(cmd_args, "pcli2 asset thumbnail").await?;
+
+    let bytes_result = fs::read(&temp_path)
+        .map_err(|err| format!("Failed to read thumbnail output: {}", err));
+    let _ = fs::remove_file(&temp_path);
+    let bytes = bytes_result?;
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("Thumbnail output was not a valid PNG file.".to_string());
     }
-    run_pcli2_command(cmd_args, "pcli2 asset thumbnail").await
+    let encoded = BASE64_STANDARD.encode(bytes);
+    Ok(encoded)
 }
 
 async fn run_pcli2_asset_reprocess(args: Value) -> Result<String, String> {
@@ -1424,6 +1450,17 @@ fn parse_string_list(args: &Value, key: &str) -> Vec<String> {
         Some(Value::String(value)) => vec![value.to_string()],
         _ => Vec::new(),
     }
+}
+
+fn temp_thumbnail_path() -> Result<PathBuf, String> {
+    let mut path = env::temp_dir();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("Failed to read system time: {}", err))?
+        .as_millis();
+    let pid = std::process::id();
+    path.push(format!("pcli2-thumbnail-{}-{}.png", pid, timestamp));
+    Ok(path)
 }
 
 fn require_uuid_or_path(args: &Value) -> Result<(Option<String>, Option<String>), String> {
