@@ -942,11 +942,16 @@ async fn call_tool(params: Value) -> Result<Value, String> {
         "pcli2_asset_thumbnail" => {
             debug!("dispatching pcli2 asset thumbnail");
             let encoded = run_pcli2_asset_thumbnail(args).await?;
+            let data_url = format!("data:image/png;base64,{}", encoded);
             Ok(json!({
                 "content": [{
                     "type": "image",
                     "media_type": "image/png",
+                    "mime_type": "image/png",
                     "data": encoded
+                }, {
+                    "type": "text",
+                    "text": data_url
                 }]
             }))
         }
