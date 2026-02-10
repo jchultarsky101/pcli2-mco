@@ -947,6 +947,9 @@ async fn call_tool(params: Value) -> Result<Value, String> {
                 "content": [{
                     "type": "image",
                     "mimeType": "image/png",
+                    "annotations": {
+                        "audience": ["user"]
+                    },
                     "data": encoded
                 }, {
                     "type": "text",
@@ -1331,9 +1334,13 @@ async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
     push_opt_string(&mut cmd_args, "--file", Some(temp_path_str));
     run_pcli2_command(cmd_args, "pcli2 asset thumbnail").await?;
 
-    let bytes = fs::read(&temp_path)
-        .map_err(|err| format!("Failed to read thumbnail output: {}", err))?;
+    let bytes_result = fs::read(&temp_path)
+        .map_err(|err| format!("Failed to read thumbnail output: {}", err));
     let _ = fs::remove_file(&temp_path);
+    let bytes = bytes_result?;
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("Thumbnail output was not a valid PNG file.".to_string());
+    }
     let encoded = BASE64_STANDARD.encode(bytes);
     Ok(encoded)
 }
