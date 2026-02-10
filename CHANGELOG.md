@@ -11,6 +11,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 
 - Added tenant state filtering via the new `--type` option for `pcli2 tenant state`.
+- Streamed asset thumbnails over MCP as base64 image content with fallback data URLs.
 
 ## [0.1.2] - 2026-02-09
 
