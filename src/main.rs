@@ -826,6 +826,17 @@ fn tool_list() -> Vec<Value> {
     let mut props = Props::new();
     add_tenant(&mut props);
     add_uuid_path(&mut props);
+    push_tool(
+        &mut tools,
+        "pcli2_asset_reprocess",
+        "Runs `pcli2 asset reprocess`.",
+        props,
+        &[],
+    );
+
+    let mut props = Props::new();
+    add_tenant(&mut props);
+    add_uuid_path(&mut props);
     add_threshold(&mut props);
     add_headers(&mut props);
     add_metadata(&mut props);
@@ -932,6 +943,7 @@ async fn call_tool(params: Value) -> Result<Value, String> {
         "pcli2_asset_get" => run_simple_tool("pcli2 asset get", run_pcli2_asset_get(args).await),
         "pcli2_asset_dependencies" => run_simple_tool("pcli2 asset dependencies", run_pcli2_asset_dependencies(args).await),
         "pcli2_asset_thumbnail" => run_simple_tool("pcli2 asset thumbnail", run_pcli2_asset_thumbnail(args).await),
+        "pcli2_asset_reprocess" => run_simple_tool("pcli2 asset reprocess", run_pcli2_asset_reprocess(args).await),
         "pcli2_geometric_match" => {
             debug!("dispatching pcli2 asset geometric-match");
             let output = run_pcli2_asset_geometric_match(args).await?;
@@ -1305,6 +1317,19 @@ async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
         cmd_args.push(file.to_string());
     }
     run_pcli2_command(cmd_args, "pcli2 asset thumbnail").await
+}
+
+async fn run_pcli2_asset_reprocess(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_asset_reprocess args={}", args);
+    let mut cmd_args: Vec<String> = vec!["asset".to_string(), "reprocess".to_string()];
+    if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
+        cmd_args.push("-t".to_string());
+        cmd_args.push(tenant.to_string());
+    }
+    let (uuid, path) = require_uuid_or_path(&args)?;
+    push_opt_string(&mut cmd_args, "--uuid", uuid.as_deref());
+    push_opt_string(&mut cmd_args, "--path", path.as_deref());
+    run_pcli2_command(cmd_args, "pcli2 asset reprocess").await
 }
 
 async fn run_pcli2_asset_part_match(args: Value) -> Result<String, String> {
