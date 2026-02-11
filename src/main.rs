@@ -249,6 +249,7 @@ async fn run_server(matches: &ArgMatches) -> Result<()> {
 
     let bind_addr = format!("{host}:{port}");
     info!("listening on http://{}", bind_addr);
+    debug!("MCP server bound to {}", bind_addr);
 
     axum::serve(
         tokio::net::TcpListener::bind(&bind_addr).await?,
@@ -2245,6 +2246,37 @@ exit 1
         )
         .await
         .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logging_on_tools_call_outputs_command() {
+        let _lock = test_env_lock().lock().await;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("debug"))
+            .with_writer(std::io::stdout)
+            .try_init();
+
+        let script_path = make_mock_pcli2();
+        let _guard = EnvVarGuard::set(PCLI2_BIN_ENV, script_path.to_string_lossy().as_ref());
+
+        let state = AppState {
+            server_name: "mock".to_string(),
+            server_version: "0.0.0".to_string(),
+        };
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "pcli2_tenant_list",
+                "arguments": {}
+            }
+        });
+        let response = handle_mcp(State(state), Bytes::from(request.to_string()))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
