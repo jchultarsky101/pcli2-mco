@@ -6,6 +6,19 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-02-11
+
+### Added
+
+- Oranda documentation publishing via GitHub Pages.
+- Oranda configuration and docs workflow.
+- Quick Start validation example for listing MCP tools with curl.
+
+### Changed
+
+- README restructured to introduce core concepts and step-by-step setup.
+- Installation guidance now prefers pre-built binaries and references source builds as optional.
+
 ## [0.1.3] - 2026-02-09
 
 ### Added
