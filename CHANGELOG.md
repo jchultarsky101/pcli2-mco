@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-02-11
+
+### Changed
+
+- Improved MCP request logging with clearer tool context.
+
 ## [0.1.5] - 2026-02-11
 
 ### Changed
