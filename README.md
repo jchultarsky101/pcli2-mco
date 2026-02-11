@@ -1,5 +1,7 @@
 # pcli2-mcp
 
+Oranda docs: https://jchultarsky101.github.io/pcli2-mcp/
+
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://jchultarsky101.github.io/pcli2-mcp/)
 [![License](https://img.shields.io/github/license/jchultarsky101/pcli2-mcp.svg)](LICENSE)
 [![CI](https://github.com/jchultarsky101/pcli2-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jchultarsky101/pcli2-mcp/actions/workflows/ci.yml)
@@ -16,7 +18,7 @@ Project links:
 
 **Status:** early development (v0.1.3).
 
-## Relationship To PCLI2
+## Main Concepts
 
 PCLI2 (Physna Command Line Interface v2) is the official CLI for the Physna public API, focused on 3D geometry search and asset/folder operations. This project is an MCP wrapper around PCLI2: it runs PCLI2 commands behind an MCP JSON-RPC interface so clients like Claude or Qwen can invoke the same capabilities programmatically. For PCLI2 documentation and usage, see the PCLI2 docs site: https://jchultarsky101.github.io/pcli2/ and the repository: https://github.com/jchultarsky101/pcli2.
 
@@ -44,6 +46,35 @@ flowchart LR
   MCP -- JSON-RPC response --> LLM
 ```
 
+## Quick Start
+
+1. Install PCLI2 and authenticate.
+   Follow the PCLI2 docs and make sure `pcli2` is on your `PATH`: https://jchultarsky101.github.io/pcli2/
+2. Install the Rust toolchain (edition 2024).
+3. Build the server:
+
+   ```bash
+   cargo build --release
+   ```
+
+   The binary will be at `target/release/pcli2-mcp`.
+4. Run the server:
+
+   ```bash
+   pcli2-mcp serve --port 8080 --log-level info
+   ```
+5. Verify the server is healthy:
+
+   ```bash
+   curl -s http://localhost:8080/health
+   ```
+6. Generate a client config snippet:
+
+   ```bash
+   pcli2-mcp config --client claude --host localhost --port 8080
+   ```
+7. Paste the snippet into your client (see the sections below).
+
 ## Features
 
 - MCP over HTTP (`/mcp`) with JSON-RPC 2.0
@@ -51,31 +82,15 @@ flowchart LR
 - Tool wrapper for `pcli2 asset geometric-match`
 - Simple, single-binary Rust server
 
-## Requirements
+## Client Setup (Using `config`)
 
-- Rust toolchain (edition 2024)
-- `pcli2` installed and available on `PATH`
-- Any required PCLI2 auth/config already set up for your environment
-
-## Installation
+The `config` command prints a ready-to-paste JSON snippet with the MCP server definition:
 
 ```bash
-cargo build --release
+pcli2-mcp config --client claude --host localhost --port 8080
 ```
 
-The binary will be at `target/release/pcli2-mcp`.
-
-## Run
-
-```bash
-cargo run -- serve --port 8080
-```
-
-Health check:
-
-```bash
-curl -s http://localhost:8080/health
-```
+Use the output in the sections below.
 
 ## CLI
 
@@ -96,16 +111,6 @@ Command-specific help:
 ```bash
 pcli2-mcp help serve
 ```
-
-## Client Setup (Using `config`)
-
-The `config` command prints a ready-to-paste JSON snippet with the MCP server definition:
-
-```bash
-pcli2-mcp config --client claude --host localhost --port 8080
-```
-
-Use the output in the sections below.
 
 ### Claude Desktop
 
