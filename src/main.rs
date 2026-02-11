@@ -324,15 +324,9 @@ async fn handle_mcp(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    info!(
-        "mcp request: method={} id={}",
-        request.method,
-        id.to_string()
-    );
-
     match request.method.as_str() {
         "initialize" => {
-            debug!("initialize request");
+            info!("🧩 initialize");
             let result = json!({
                 "protocolVersion": "2025-03-26",
                 "serverInfo": {
@@ -346,14 +340,18 @@ async fn handle_mcp(
             json_ok(id, result).into_response()
         }
         "tools/list" => {
-            debug!("tools/list request");
+            info!("🔧 tools/list");
             let tools = tool_list();
             let result = json!({ "tools": tools });
             json_ok(id, result).into_response()
         }
         "tools/call" => {
             let params = request.params.unwrap_or_else(|| json!({}));
-            debug!("tools/call request params={}", params);
+            let tool_name = params
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            info!("🔧 tools/call name={}", tool_name);
             match call_tool(params).await {
                 Ok(result) => json_ok(id, result).into_response(),
                 Err(message) => json_error(id, -32602, message).into_response(),
