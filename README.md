@@ -276,6 +276,7 @@ Notes:
 | `pcli2_asset_visual_match` | `pcli2 asset visual-match` | `uuid` or `path` |
 | `pcli2_asset_text_match` | `pcli2 asset text-match` | `text` |
 | `pcli2_asset_metadata_create` | `pcli2 asset metadata create` | `name`, `value`, plus `uuid` or `path` |
+| `pcli2_asset_metadata_delete` | `pcli2 asset metadata delete` | `name`, plus `uuid` or `path` |
 
 Example:
 

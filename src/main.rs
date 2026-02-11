@@ -546,6 +546,20 @@ fn add_metadata_name_value(props: &mut Props) {
     );
 }
 
+fn add_metadata_name(props: &mut Props) {
+    add_prop(
+        props,
+        "name",
+        json!({
+            "oneOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+            ],
+            "description": "Metadata property name. Can be a string, comma-separated string, or array."
+        }),
+    );
+}
+
 fn tool_list() -> Vec<Value> {
     debug!("building tool list");
     let mut tools = Vec::new();
@@ -898,6 +912,19 @@ fn tool_list() -> Vec<Value> {
         &["name", "value"],
     );
 
+    let mut props = Props::new();
+    add_tenant(&mut props);
+    add_uuid_path(&mut props);
+    add_metadata_name(&mut props);
+    add_format(&mut props, &["json", "csv"]);
+    push_tool(
+        &mut tools,
+        "pcli2_asset_metadata_delete",
+        "Runs `pcli2 asset metadata delete`.",
+        props,
+        &["name"],
+    );
+
     tools
 }
 
@@ -970,6 +997,7 @@ async fn call_tool(params: Value) -> Result<Value, String> {
         "pcli2_asset_visual_match" => run_simple_tool("pcli2 asset visual-match", run_pcli2_asset_visual_match(args).await),
         "pcli2_asset_text_match" => run_simple_tool("pcli2 asset text-match", run_pcli2_asset_text_match(args).await),
         "pcli2_asset_metadata_create" => run_simple_tool("pcli2 asset metadata create", run_pcli2_asset_metadata_create(args).await),
+        "pcli2_asset_metadata_delete" => run_simple_tool("pcli2 asset metadata delete", run_pcli2_asset_metadata_delete(args).await),
         _ => Err(format!("Unknown tool '{}'", name)),
     }
 }
@@ -1439,6 +1467,44 @@ async fn run_pcli2_asset_metadata_create(args: Value) -> Result<String, String> 
     run_pcli2_command(cmd_args, "pcli2 asset metadata create").await
 }
 
+async fn run_pcli2_asset_metadata_delete(args: Value) -> Result<String, String> {
+    debug!("run_pcli2_asset_metadata_delete args={}", args);
+    let mut cmd_args: Vec<String> = vec!["asset".to_string(), "metadata".to_string(), "delete".to_string()];
+    if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
+        cmd_args.push("-t".to_string());
+        cmd_args.push(tenant.to_string());
+    }
+    let (uuid, path) = require_uuid_or_path(&args)?;
+    push_opt_string(&mut cmd_args, "--uuid", uuid.as_deref());
+    push_opt_string(&mut cmd_args, "--path", path.as_deref());
+    let names: Vec<String> = match args.get("name") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .flat_map(|value| value.split(','))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(value)) => value
+            .split(',')
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        return Err("Missing required argument: 'name'".to_string());
+    }
+    for name in names {
+        cmd_args.push("--name".to_string());
+        cmd_args.push(name);
+    }
+    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    run_pcli2_command(cmd_args, "pcli2 asset metadata delete").await
+}
+
 fn parse_string_list(args: &Value, key: &str) -> Vec<String> {
     match args.get(key) {
         Some(Value::Array(values)) => values
@@ -1579,6 +1645,7 @@ fn print_banner() {
         println!("{}", gradient_line(line));
     }
     println!("{}", gradient_line("          Model Context Protocol Server for PCLI2           "));
+    println!("Version {}", APP_VERSION);
     println!();
 }
 
