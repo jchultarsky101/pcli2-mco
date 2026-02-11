@@ -1645,6 +1645,7 @@ fn print_banner() {
         println!("{}", gradient_line(line));
     }
     println!("{}", gradient_line("          Model Context Protocol Server for PCLI2           "));
+    println!("Version {}", APP_VERSION);
     println!();
 }
 
