@@ -1,22 +1,27 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use axum::{
+    BoxError, Json, Router,
     body::Bytes,
-    extract::State,
+    error_handling::HandleErrorLayer,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use clap::{value_parser, Arg, ArgMatches, Command};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use clap::{Arg, ArgMatches, Command, value_parser};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tower::{ServiceBuilder, timeout::TimeoutLayer};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -48,6 +53,11 @@ const MCP_SERVER_ALIAS: &str = "pcli2";
 const MCP_REMOTE_COMMAND: &str = "npx";
 const MCP_REMOTE_PACKAGE: &str = "mcp-remote";
 
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PCLI2_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_PCLI2_OUTPUT_BYTES: usize = 200 * 1024 * 1024;
+
 #[derive(Clone)]
 struct AppState {
     server_name: String,
@@ -58,7 +68,7 @@ struct AppState {
 struct RpcRequest {
     jsonrpc: Option<String>,
     id: Option<Value>,
-    method: String,
+    method: Option<String>,
     params: Option<Value>,
 }
 
@@ -85,17 +95,15 @@ struct RpcErrorBody {
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = build_cli().get_matches();
-    let log_level = matches
-        .subcommand()
-        .and_then(|(name, sub_matches)| {
-            if name == CMD_SERVE {
-                sub_matches
-                    .get_one::<String>(ARG_LOG_LEVEL)
-                    .map(|value| value.as_str())
-            } else {
-                None
-            }
-        });
+    let log_level = matches.subcommand().and_then(|(name, sub_matches)| {
+        if name == CMD_SERVE {
+            sub_matches
+                .get_one::<String>(ARG_LOG_LEVEL)
+                .map(|value| value.as_str())
+        } else {
+            None
+        }
+    });
     init_logging(log_level);
 
     match matches.subcommand() {
@@ -107,11 +115,11 @@ async fn main() -> Result<()> {
 }
 
 fn init_logging(level: Option<&str>) {
-    if let Some(level) = level {
-        if std::env::var("RUST_LOG").is_err() {
-            unsafe {
-                std::env::set_var("RUST_LOG", level);
-            }
+    if let Some(level) = level
+        && std::env::var("RUST_LOG").is_err()
+    {
+        unsafe {
+            std::env::set_var("RUST_LOG", level);
         }
     }
     let subscriber = FmtSubscriber::builder()
@@ -119,8 +127,7 @@ fn init_logging(level: Option<&str>) {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
 fn build_cli() -> Command {
@@ -212,7 +219,22 @@ async fn run_server(matches: &ArgMatches) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/mcp", post(handle_mcp))
-        .with_state(state);
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|error: BoxError| async move {
+                    if error.is::<tower::timeout::error::Elapsed>() {
+                        (StatusCode::REQUEST_TIMEOUT, "Request timed out")
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Unhandled internal error",
+                        )
+                    }
+                }))
+                .layer(TimeoutLayer::new(REQUEST_TIMEOUT))
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
+        );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("listening on http://{}", addr);
@@ -250,10 +272,7 @@ fn run_help(matches: &ArgMatches) -> Result<()> {
     let mut cmd = build_cli();
 
     if let Some(name) = target {
-        if let Some(sub) = cmd
-            .get_subcommands()
-            .find(|sub| sub.get_name() == name)
-        {
+        if let Some(sub) = cmd.get_subcommands().find(|sub| sub.get_name() == name) {
             let mut sub_cmd = sub.clone();
             sub_cmd.print_help()?;
             println!();
@@ -293,38 +312,67 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn handle_mcp(
-    State(state): State<AppState>,
-    bytes: Bytes,
-) -> impl IntoResponse {
-    let request: RpcRequest = match serde_json::from_slice(&bytes) {
-        Ok(req) => req,
+fn parse_rpc_request(value: Value) -> Result<RpcRequest, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "Invalid Request: expected a JSON object".to_string())?;
+    let jsonrpc = match obj.get("jsonrpc") {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err("Invalid Request: 'jsonrpc' must be a string".to_string());
+        }
+        None => None,
+    };
+    let id = obj.get("id").cloned();
+    let method = match obj.get("method") {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err("Invalid Request: 'method' must be a string".to_string()),
+        None => None,
+    };
+    let params = obj.get("params").cloned();
+    Ok(RpcRequest {
+        jsonrpc,
+        id,
+        method,
+        params,
+    })
+}
+
+async fn handle_mcp(State(state): State<AppState>, bytes: Bytes) -> impl IntoResponse {
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
         Err(_) => {
-            return json_error(
-                Value::Null,
-                -32700,
-                "Parse error: invalid JSON".to_string(),
-            )
-            .into_response();
+            return json_error(Value::Null, -32700, "Parse error: invalid JSON".to_string())
+                .into_response();
+        }
+    };
+
+    let request = match parse_rpc_request(value) {
+        Ok(request) => request,
+        Err(message) => {
+            return json_error(Value::Null, -32600, message).into_response();
         }
     };
 
     let id = request.id.clone().unwrap_or(Value::Null);
-    if let Some(version) = request.jsonrpc.as_deref() {
-        if version != "2.0" {
-            return json_error(
-                id,
-                -32600,
-                format!("Invalid jsonrpc version '{}'", version),
-            )
+    if let Some(version) = request.jsonrpc.as_deref()
+        && version != "2.0"
+    {
+        return json_error(id, -32600, format!("Invalid jsonrpc version '{}'", version))
             .into_response();
-        }
     }
+    let method = match request.method.as_deref() {
+        Some(method) => method,
+        None => {
+            return json_error(id, -32600, "Invalid Request: missing 'method'".to_string())
+                .into_response();
+        }
+    };
     if id.is_null() {
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    match request.method.as_str() {
+    match method {
         "initialize" => {
             info!("🧩 initialize");
             let result = json!({
@@ -357,12 +405,7 @@ async fn handle_mcp(
                 Err(message) => json_error(id, -32602, message).into_response(),
             }
         }
-        _ => json_error(
-            id,
-            -32601,
-            format!("Method '{}' not found", request.method),
-        )
-        .into_response(),
+        _ => json_error(id, -32601, format!("Method '{}' not found", method)).into_response(),
     }
 }
 
@@ -384,7 +427,13 @@ fn json_error(id: Value, code: i64, message: String) -> Json<RpcErrorResponse> {
 
 type Props = Map<String, Value>;
 
-fn push_tool(tools: &mut Vec<Value>, name: &str, description: &str, properties: Props, required: &[&str]) {
+fn push_tool(
+    tools: &mut Vec<Value>,
+    name: &str,
+    description: &str,
+    properties: Props,
+    required: &[&str],
+) {
     tools.push(json!({
         "name": name,
         "description": description,
@@ -394,6 +443,20 @@ fn push_tool(tools: &mut Vec<Value>, name: &str, description: &str, properties: 
             "required": required
         }
     }));
+}
+
+fn define_tool<F>(
+    tools: &mut Vec<Value>,
+    name: &str,
+    description: &str,
+    required: &[&str],
+    build: F,
+) where
+    F: FnOnce(&mut Props),
+{
+    let mut props = Props::new();
+    build(&mut props);
+    push_tool(tools, name, description, props, required);
 }
 
 fn add_prop(props: &mut Props, key: &str, value: Value) {
@@ -564,365 +627,419 @@ fn tool_list() -> Vec<Value> {
     debug!("building tool list");
     let mut tools = Vec::new();
 
-    let mut props = Props::new();
-    add_prop(
-        &mut props,
-        "resource",
-        json!({ "type": "string", "enum": ["folder", "asset"], "description": "Resource to list. Defaults to folder." }),
-    );
-    add_tenant(&mut props);
-    add_metadata(&mut props);
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    add_prop(&mut props, "folder_uuid", json!({ "type": "string", "description": "Folder UUID." }));
-    add_prop(&mut props, "folder_path", json!({ "type": "string", "description": "Folder path, e.g. /Root/Child." }));
-    add_prop(&mut props, "reload", json!({ "type": "boolean", "description": "Reload folder cache from server." }));
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2",
         "Physna Command Line Interface v2 (PCLI2). Runs `pcli2 folder list` or `pcli2 asset list` with the provided options.",
-        props,
         &[],
+        |props| {
+            add_prop(
+                props,
+                "resource",
+                json!({ "type": "string", "enum": ["folder", "asset"], "description": "Resource to list. Defaults to folder." }),
+            );
+            add_tenant(props);
+            add_metadata(props);
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+            add_prop(
+                props,
+                "folder_uuid",
+                json!({ "type": "string", "description": "Folder UUID." }),
+            );
+            add_prop(
+                props,
+                "folder_path",
+                json!({ "type": "string", "description": "Folder path, e.g. /Root/Child." }),
+            );
+            add_prop(
+                props,
+                "reload",
+                json!({ "type": "boolean", "description": "Reload folder cache from server." }),
+            );
+        },
     );
 
-    let mut props = Props::new();
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(&mut tools, "pcli2_tenant_list", "Runs `pcli2 tenant list`.", props, &[]);
+    define_tool(
+        &mut tools,
+        "pcli2_tenant_list",
+        "Runs `pcli2 tenant list`.",
+        &[],
+        |props| {
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
+    );
 
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_version",
         "Runs `pcli2 --version`.",
-        Props::new(),
         &[],
+        |_| {},
     );
 
-    let mut props = Props::new();
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    push_tool(&mut tools, "pcli2_config_get", "Runs `pcli2 config get`.", props, &[]);
+    define_tool(
+        &mut tools,
+        "pcli2_config_get",
+        "Runs `pcli2 config get`.",
+        &[],
+        |props| {
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+        },
+    );
 
-    let mut props = Props::new();
-    add_format(&mut props, &["json", "csv", "tree"]);
-    push_tool(&mut tools, "pcli2_config_get_path", "Runs `pcli2 config get path`.", props, &[]);
+    define_tool(
+        &mut tools,
+        "pcli2_config_get_path",
+        "Runs `pcli2 config get path`.",
+        &[],
+        |props| {
+            add_format(props, &["json", "csv", "tree"]);
+        },
+    );
 
-    let mut props = Props::new();
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_config_environment_list",
         "Runs `pcli2 config environment list`.",
-        props,
         &[],
+        |props| {
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_prop(
-        &mut props,
-        "name",
-        json!({ "type": "string", "description": "Environment name (defaults to active environment)." }),
-    );
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_config_environment_get",
         "Runs `pcli2 config environment get`.",
-        props,
         &[],
+        |props| {
+            add_prop(
+                props,
+                "name",
+                json!({ "type": "string", "description": "Environment name (defaults to active environment)." }),
+            );
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_tenant_get",
         "Runs `pcli2 tenant get` (current tenant).",
-        props,
         &[],
+        |props| {
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_prop(
-        &mut props,
-        "type",
-        json!({
-            "type": "string",
-            "description": "Filter assets by state.",
-            "enum": [
-                "indexing",
-                "finished",
-                "failed",
-                "unsupported",
-                "no-3d-data",
-                "missing-dependencies"
-            ]
-        }),
+    define_tool(
+        &mut tools,
+        "pcli2_tenant_state",
+        "Runs `pcli2 tenant state`.",
+        &[],
+        |props| {
+            add_tenant(props);
+            add_prop(
+                props,
+                "type",
+                json!({
+                    "type": "string",
+                    "description": "Filter assets by state.",
+                    "enum": [
+                        "indexing",
+                        "finished",
+                        "failed",
+                        "unsupported",
+                        "no-3d-data",
+                        "missing-dependencies"
+                    ]
+                }),
+            );
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(&mut tools, "pcli2_tenant_state", "Runs `pcli2 tenant state`.", props, &[]);
 
-    let mut props = Props::new();
-    add_prop(
-        &mut props,
-        "name",
-        json!({ "type": "string", "description": "Tenant short name (as shown in tenant list)." }),
-    );
-    add_prop(
-        &mut props,
-        "tenant_name",
-        json!({ "type": "string", "description": "Tenant short name (alias for name)." }),
-    );
-    add_prop(
-        &mut props,
-        "refresh",
-        json!({ "type": "boolean", "description": "Force refresh cache data from API." }),
-    );
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_tenant_use",
         "Runs `pcli2 tenant use --name <tenantName>`.",
-        props,
         &[],
+        |props| {
+            add_prop(
+                props,
+                "name",
+                json!({ "type": "string", "description": "Tenant short name (as shown in tenant list)." }),
+            );
+            add_prop(
+                props,
+                "tenant_name",
+                json!({ "type": "string", "description": "Tenant short name (alias for name)." }),
+            );
+            add_prop(
+                props,
+                "refresh",
+                json!({ "type": "boolean", "description": "Force refresh cache data from API." }),
+            );
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_folder_uuid_path(&mut props);
-    add_metadata(&mut props);
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    push_tool(&mut tools, "pcli2_folder_get", "Runs `pcli2 folder get`.", props, &[]);
-
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_prop(
-        &mut props,
-        "folder_path",
-        json!({ "type": "string", "description": "Folder path, e.g. /Root/Child/Grandchild." }),
+    define_tool(
+        &mut tools,
+        "pcli2_folder_get",
+        "Runs `pcli2 folder get`.",
+        &[],
+        |props| {
+            add_tenant(props);
+            add_folder_uuid_path(props);
+            add_metadata(props);
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+        },
     );
-    push_tool(
+
+    define_tool(
         &mut tools,
         "pcli2_folder_resolve",
         "Runs `pcli2 folder resolve`.",
-        props,
         &["folder_path"],
+        |props| {
+            add_tenant(props);
+            add_prop(
+                props,
+                "folder_path",
+                json!({ "type": "string", "description": "Folder path, e.g. /Root/Child/Grandchild." }),
+            );
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_folder_path_list(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    add_progress(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_folder_dependencies",
         "Runs `pcli2 folder dependencies`.",
-        props,
         &["folder_path"],
+        |props| {
+            add_tenant(props);
+            add_folder_path_list(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+            add_progress(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_folder_path_list(&mut props);
-    add_threshold(&mut props);
-    add_exclusive(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    add_concurrent(&mut props);
-    add_progress(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_folder_geometric_match",
         "Runs `pcli2 folder geometric-match`.",
-        props,
         &["folder_path"],
+        |props| {
+            add_tenant(props);
+            add_folder_path_list(props);
+            add_threshold(props);
+            add_exclusive(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+            add_concurrent(props);
+            add_progress(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_folder_path_list(&mut props);
-    add_threshold(&mut props);
-    add_exclusive(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    add_concurrent(&mut props);
-    add_progress(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_folder_part_match",
         "Runs `pcli2 folder part-match`.",
-        props,
         &["folder_path"],
+        |props| {
+            add_tenant(props);
+            add_folder_path_list(props);
+            add_threshold(props);
+            add_exclusive(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+            add_concurrent(props);
+            add_progress(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_folder_path_list(&mut props);
-    add_exclusive(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    add_concurrent(&mut props);
-    add_progress(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_folder_visual_match",
         "Runs `pcli2 folder visual-match`.",
-        props,
         &["folder_path"],
+        |props| {
+            add_tenant(props);
+            add_folder_path_list(props);
+            add_exclusive(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+            add_concurrent(props);
+            add_progress(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(&mut tools, "pcli2_asset_get", "Runs `pcli2 asset get`.", props, &[]);
+    define_tool(
+        &mut tools,
+        "pcli2_asset_get",
+        "Runs `pcli2 asset get`.",
+        &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
+    );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_metadata(&mut props);
-    add_headers(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv", "tree"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_dependencies",
         "Runs `pcli2 asset dependencies`.",
-        props,
         &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_metadata(props);
+            add_headers(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv", "tree"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_thumbnail",
         "Runs `pcli2 asset thumbnail` and returns a base64-encoded PNG.",
-        props,
         &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_reprocess",
         "Runs `pcli2 asset reprocess`.",
-        props,
         &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_threshold(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_geometric_match",
         "Physna Command Line Interface v2 (PCLI2). Runs `pcli2 asset geometric-match` with the provided options.",
-        props,
         &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_threshold(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_threshold(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(&mut tools, "pcli2_asset_part_match", "Runs `pcli2 asset part-match`.", props, &[]);
+    define_tool(
+        &mut tools,
+        "pcli2_asset_part_match",
+        "Runs `pcli2 asset part-match`.",
+        &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_threshold(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
+    );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_visual_match",
         "Runs `pcli2 asset visual-match`.",
-        props,
         &[],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_text(&mut props);
-    add_fuzzy(&mut props);
-    add_headers(&mut props);
-    add_metadata(&mut props);
-    add_pretty(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_text_match",
         "Runs `pcli2 asset text-match`.",
-        props,
         &["text"],
+        |props| {
+            add_tenant(props);
+            add_text(props);
+            add_fuzzy(props);
+            add_headers(props);
+            add_metadata(props);
+            add_pretty(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_metadata_name_value(&mut props);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_metadata_create",
         "Runs `pcli2 asset metadata create`.",
-        props,
         &["name", "value"],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_metadata_name_value(props);
+        },
     );
 
-    let mut props = Props::new();
-    add_tenant(&mut props);
-    add_uuid_path(&mut props);
-    add_metadata_name(&mut props);
-    add_format(&mut props, &["json", "csv"]);
-    push_tool(
+    define_tool(
         &mut tools,
         "pcli2_asset_metadata_delete",
         "Runs `pcli2 asset metadata delete`.",
-        props,
         &["name"],
+        |props| {
+            add_tenant(props);
+            add_uuid_path(props);
+            add_metadata_name(props);
+            add_format(props, &["json", "csv"]);
+        },
     );
 
     tools
@@ -934,7 +1051,10 @@ async fn call_tool(params: Value) -> Result<Value, String> {
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Missing tool name".to_string())?;
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     match name {
         "pcli2" => {
@@ -947,23 +1067,53 @@ async fn call_tool(params: Value) -> Result<Value, String> {
                 }]
             }))
         }
-        "pcli2_tenant_list" => run_simple_tool("pcli2 tenant list", run_pcli2_tenant_list(args).await),
+        "pcli2_tenant_list" => {
+            run_simple_tool("pcli2 tenant list", run_pcli2_tenant_list(args).await)
+        }
         "pcli2_version" => run_simple_tool("pcli2 --version", run_pcli2_version().await),
         "pcli2_config_get" => run_simple_tool("pcli2 config get", run_pcli2_config_get(args).await),
-        "pcli2_config_get_path" => run_simple_tool("pcli2 config get path", run_pcli2_config_get_path(args).await),
-        "pcli2_config_environment_list" => run_simple_tool("pcli2 config environment list", run_pcli2_config_environment_list(args).await),
-        "pcli2_config_environment_get" => run_simple_tool("pcli2 config environment get", run_pcli2_config_environment_get(args).await),
+        "pcli2_config_get_path" => run_simple_tool(
+            "pcli2 config get path",
+            run_pcli2_config_get_path(args).await,
+        ),
+        "pcli2_config_environment_list" => run_simple_tool(
+            "pcli2 config environment list",
+            run_pcli2_config_environment_list(args).await,
+        ),
+        "pcli2_config_environment_get" => run_simple_tool(
+            "pcli2 config environment get",
+            run_pcli2_config_environment_get(args).await,
+        ),
         "pcli2_tenant_get" => run_simple_tool("pcli2 tenant get", run_pcli2_tenant_get(args).await),
-        "pcli2_tenant_state" => run_simple_tool("pcli2 tenant state", run_pcli2_tenant_state(args).await),
+        "pcli2_tenant_state" => {
+            run_simple_tool("pcli2 tenant state", run_pcli2_tenant_state(args).await)
+        }
         "pcli2_tenant_use" => run_simple_tool("pcli2 tenant use", run_pcli2_tenant_use(args).await),
         "pcli2_folder_get" => run_simple_tool("pcli2 folder get", run_pcli2_folder_get(args).await),
-        "pcli2_folder_resolve" => run_simple_tool("pcli2 folder resolve", run_pcli2_folder_resolve(args).await),
-        "pcli2_folder_dependencies" => run_simple_tool("pcli2 folder dependencies", run_pcli2_folder_dependencies(args).await),
-        "pcli2_folder_geometric_match" => run_simple_tool("pcli2 folder geometric-match", run_pcli2_folder_geometric_match(args).await),
-        "pcli2_folder_part_match" => run_simple_tool("pcli2 folder part-match", run_pcli2_folder_part_match(args).await),
-        "pcli2_folder_visual_match" => run_simple_tool("pcli2 folder visual-match", run_pcli2_folder_visual_match(args).await),
+        "pcli2_folder_resolve" => {
+            run_simple_tool("pcli2 folder resolve", run_pcli2_folder_resolve(args).await)
+        }
+        "pcli2_folder_dependencies" => run_simple_tool(
+            "pcli2 folder dependencies",
+            run_pcli2_folder_dependencies(args).await,
+        ),
+        "pcli2_folder_geometric_match" => run_simple_tool(
+            "pcli2 folder geometric-match",
+            run_pcli2_folder_geometric_match(args).await,
+        ),
+        "pcli2_folder_part_match" => run_simple_tool(
+            "pcli2 folder part-match",
+            run_pcli2_folder_part_match(args).await,
+        ),
+        "pcli2_folder_visual_match" => run_simple_tool(
+            "pcli2 folder visual-match",
+            run_pcli2_folder_visual_match(args).await,
+        ),
         "pcli2_asset_get" => run_simple_tool("pcli2 asset get", run_pcli2_asset_get(args).await),
-        "pcli2_asset_dependencies" => run_simple_tool("pcli2 asset dependencies", run_pcli2_asset_dependencies(args).await),
+        "pcli2_asset_dependencies" => run_simple_tool(
+            "pcli2 asset dependencies",
+            run_pcli2_asset_dependencies(args).await,
+        ),
         "pcli2_asset_thumbnail" => {
             debug!("dispatching pcli2 asset thumbnail");
             let encoded = run_pcli2_asset_thumbnail(args).await?;
@@ -982,7 +1132,10 @@ async fn call_tool(params: Value) -> Result<Value, String> {
                 }]
             }))
         }
-        "pcli2_asset_reprocess" => run_simple_tool("pcli2 asset reprocess", run_pcli2_asset_reprocess(args).await),
+        "pcli2_asset_reprocess" => run_simple_tool(
+            "pcli2 asset reprocess",
+            run_pcli2_asset_reprocess(args).await,
+        ),
         "pcli2_geometric_match" => {
             debug!("dispatching pcli2 asset geometric-match");
             let output = run_pcli2_asset_geometric_match(args).await?;
@@ -993,11 +1146,26 @@ async fn call_tool(params: Value) -> Result<Value, String> {
                 }]
             }))
         }
-        "pcli2_asset_part_match" => run_simple_tool("pcli2 asset part-match", run_pcli2_asset_part_match(args).await),
-        "pcli2_asset_visual_match" => run_simple_tool("pcli2 asset visual-match", run_pcli2_asset_visual_match(args).await),
-        "pcli2_asset_text_match" => run_simple_tool("pcli2 asset text-match", run_pcli2_asset_text_match(args).await),
-        "pcli2_asset_metadata_create" => run_simple_tool("pcli2 asset metadata create", run_pcli2_asset_metadata_create(args).await),
-        "pcli2_asset_metadata_delete" => run_simple_tool("pcli2 asset metadata delete", run_pcli2_asset_metadata_delete(args).await),
+        "pcli2_asset_part_match" => run_simple_tool(
+            "pcli2 asset part-match",
+            run_pcli2_asset_part_match(args).await,
+        ),
+        "pcli2_asset_visual_match" => run_simple_tool(
+            "pcli2 asset visual-match",
+            run_pcli2_asset_visual_match(args).await,
+        ),
+        "pcli2_asset_text_match" => run_simple_tool(
+            "pcli2 asset text-match",
+            run_pcli2_asset_text_match(args).await,
+        ),
+        "pcli2_asset_metadata_create" => run_simple_tool(
+            "pcli2 asset metadata create",
+            run_pcli2_asset_metadata_create(args).await,
+        ),
+        "pcli2_asset_metadata_delete" => run_simple_tool(
+            "pcli2 asset metadata delete",
+            run_pcli2_asset_metadata_delete(args).await,
+        ),
         _ => Err(format!("Unknown tool '{}'", name)),
     }
 }
@@ -1026,13 +1194,25 @@ async fn run_pcli2_list(args: Value) -> Result<String, String> {
         cmd_args.push("-t".to_string());
         cmd_args.push(tenant.to_string());
     }
-    if args.get("metadata").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if args
+        .get("metadata")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         cmd_args.push("--metadata".to_string());
     }
-    if args.get("headers").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if args
+        .get("headers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         cmd_args.push("--headers".to_string());
     }
-    if args.get("pretty").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if args
+        .get("pretty")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         cmd_args.push("--pretty".to_string());
     }
     if let Some(format) = args.get("format").and_then(|v| v.as_str()) {
@@ -1047,7 +1227,11 @@ async fn run_pcli2_list(args: Value) -> Result<String, String> {
         cmd_args.push("--folder-path".to_string());
         cmd_args.push(folder_path.to_string());
     }
-    if args.get("reload").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if args
+        .get("reload")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         cmd_args.push("--reload".to_string());
     }
 
@@ -1056,10 +1240,8 @@ async fn run_pcli2_list(args: Value) -> Result<String, String> {
 
 async fn run_pcli2_asset_geometric_match(args: Value) -> Result<String, String> {
     debug!("run_pcli2_asset_geometric_match args={}", args);
-    let mut cmd_args: Vec<String> = vec![
-        "asset".to_string(),
-        "geometric-match".to_string(),
-    ];
+    validate_range_f64(&args, "threshold", 0.0, 100.0)?;
+    let mut cmd_args: Vec<String> = vec!["asset".to_string(), "geometric-match".to_string()];
 
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1073,7 +1255,11 @@ async fn run_pcli2_asset_geometric_match(args: Value) -> Result<String, String> 
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
 
     run_pcli2_command(cmd_args, "pcli2 asset geometric-match").await
 }
@@ -1083,7 +1269,11 @@ async fn run_pcli2_tenant_list(args: Value) -> Result<String, String> {
     let mut cmd_args: Vec<String> = vec!["tenant".to_string(), "list".to_string()];
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 tenant list").await
 }
 
@@ -1098,14 +1288,23 @@ async fn run_pcli2_config_get(args: Value) -> Result<String, String> {
     let mut cmd_args: Vec<String> = vec!["config".to_string(), "get".to_string()];
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 config get").await
 }
 
 async fn run_pcli2_config_get_path(args: Value) -> Result<String, String> {
     debug!("run_pcli2_config_get_path args={}", args);
-    let mut cmd_args: Vec<String> = vec!["config".to_string(), "get".to_string(), "path".to_string()];
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    let mut cmd_args: Vec<String> =
+        vec!["config".to_string(), "get".to_string(), "path".to_string()];
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 config get path").await
 }
 
@@ -1118,7 +1317,11 @@ async fn run_pcli2_config_environment_list(args: Value) -> Result<String, String
     ];
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 config environment list").await
 }
 
@@ -1129,10 +1332,18 @@ async fn run_pcli2_config_environment_get(args: Value) -> Result<String, String>
         "environment".to_string(),
         "get".to_string(),
     ];
-    push_opt_string(&mut cmd_args, "-n", args.get("name").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-n",
+        args.get("name").and_then(|v| v.as_str()),
+    );
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 config environment get").await
 }
 
@@ -1141,7 +1352,11 @@ async fn run_pcli2_tenant_get(args: Value) -> Result<String, String> {
     let mut cmd_args: Vec<String> = vec!["tenant".to_string(), "get".to_string()];
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 tenant get").await
 }
 
@@ -1152,10 +1367,18 @@ async fn run_pcli2_tenant_state(args: Value) -> Result<String, String> {
         cmd_args.push("-t".to_string());
         cmd_args.push(tenant.to_string());
     }
-    push_opt_string(&mut cmd_args, "--type", args.get("type").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "--type",
+        args.get("type").and_then(|v| v.as_str()),
+    );
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 tenant state").await
 }
 
@@ -1172,7 +1395,11 @@ async fn run_pcli2_tenant_use(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "refresh", "--refresh");
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 tenant use").await
 }
 
@@ -1189,7 +1416,11 @@ async fn run_pcli2_folder_get(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 folder get").await
 }
 
@@ -1227,13 +1458,19 @@ async fn run_pcli2_folder_dependencies(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     push_flag_if(&mut cmd_args, &args, "progress", "--progress");
     run_pcli2_command(cmd_args, "pcli2 folder dependencies").await
 }
 
 async fn run_pcli2_folder_geometric_match(args: Value) -> Result<String, String> {
     debug!("run_pcli2_folder_geometric_match args={}", args);
+    validate_range_f64(&args, "threshold", 0.0, 100.0)?;
+    validate_range_u64(&args, "concurrent", 1, 10)?;
     let mut cmd_args: Vec<String> = vec!["folder".to_string(), "geometric-match".to_string()];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1252,7 +1489,11 @@ async fn run_pcli2_folder_geometric_match(args: Value) -> Result<String, String>
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     push_opt_u64(&mut cmd_args, &args, "concurrent", "--concurrent");
     push_flag_if(&mut cmd_args, &args, "progress", "--progress");
     run_pcli2_command(cmd_args, "pcli2 folder geometric-match").await
@@ -1260,6 +1501,8 @@ async fn run_pcli2_folder_geometric_match(args: Value) -> Result<String, String>
 
 async fn run_pcli2_folder_part_match(args: Value) -> Result<String, String> {
     debug!("run_pcli2_folder_part_match args={}", args);
+    validate_range_f64(&args, "threshold", 0.0, 100.0)?;
+    validate_range_u64(&args, "concurrent", 1, 10)?;
     let mut cmd_args: Vec<String> = vec!["folder".to_string(), "part-match".to_string()];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1278,7 +1521,11 @@ async fn run_pcli2_folder_part_match(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     push_opt_u64(&mut cmd_args, &args, "concurrent", "--concurrent");
     push_flag_if(&mut cmd_args, &args, "progress", "--progress");
     run_pcli2_command(cmd_args, "pcli2 folder part-match").await
@@ -1286,6 +1533,7 @@ async fn run_pcli2_folder_part_match(args: Value) -> Result<String, String> {
 
 async fn run_pcli2_folder_visual_match(args: Value) -> Result<String, String> {
     debug!("run_pcli2_folder_visual_match args={}", args);
+    validate_range_u64(&args, "concurrent", 1, 10)?;
     let mut cmd_args: Vec<String> = vec!["folder".to_string(), "visual-match".to_string()];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1303,7 +1551,11 @@ async fn run_pcli2_folder_visual_match(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     push_opt_u64(&mut cmd_args, &args, "concurrent", "--concurrent");
     push_flag_if(&mut cmd_args, &args, "progress", "--progress");
     run_pcli2_command(cmd_args, "pcli2 folder visual-match").await
@@ -1322,7 +1574,11 @@ async fn run_pcli2_asset_get(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset get").await
 }
 
@@ -1339,7 +1595,11 @@ async fn run_pcli2_asset_dependencies(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset dependencies").await
 }
 
@@ -1360,8 +1620,8 @@ async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
     push_opt_string(&mut cmd_args, "--file", Some(temp_path_str));
     run_pcli2_command(cmd_args, "pcli2 asset thumbnail").await?;
 
-    let bytes_result = fs::read(&temp_path)
-        .map_err(|err| format!("Failed to read thumbnail output: {}", err));
+    let bytes_result =
+        fs::read(&temp_path).map_err(|err| format!("Failed to read thumbnail output: {}", err));
     let _ = fs::remove_file(&temp_path);
     let bytes = bytes_result?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -1386,6 +1646,7 @@ async fn run_pcli2_asset_reprocess(args: Value) -> Result<String, String> {
 
 async fn run_pcli2_asset_part_match(args: Value) -> Result<String, String> {
     debug!("run_pcli2_asset_part_match args={}", args);
+    validate_range_f64(&args, "threshold", 0.0, 100.0)?;
     let mut cmd_args: Vec<String> = vec!["asset".to_string(), "part-match".to_string()];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1398,7 +1659,11 @@ async fn run_pcli2_asset_part_match(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset part-match").await
 }
 
@@ -1415,7 +1680,11 @@ async fn run_pcli2_asset_visual_match(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset visual-match").await
 }
 
@@ -1436,13 +1705,21 @@ async fn run_pcli2_asset_text_match(args: Value) -> Result<String, String> {
     push_flag_if(&mut cmd_args, &args, "headers", "--headers");
     push_flag_if(&mut cmd_args, &args, "metadata", "--metadata");
     push_flag_if(&mut cmd_args, &args, "pretty", "--pretty");
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset text-match").await
 }
 
 async fn run_pcli2_asset_metadata_create(args: Value) -> Result<String, String> {
     debug!("run_pcli2_asset_metadata_create args={}", args);
-    let mut cmd_args: Vec<String> = vec!["asset".to_string(), "metadata".to_string(), "create".to_string()];
+    let mut cmd_args: Vec<String> = vec![
+        "asset".to_string(),
+        "metadata".to_string(),
+        "create".to_string(),
+    ];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
         cmd_args.push(tenant.to_string());
@@ -1463,13 +1740,21 @@ async fn run_pcli2_asset_metadata_create(args: Value) -> Result<String, String> 
     cmd_args.push(name.to_string());
     cmd_args.push("--value".to_string());
     cmd_args.push(value.to_string());
-    push_opt_string(&mut cmd_args, "--type", args.get("type").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "--type",
+        args.get("type").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset metadata create").await
 }
 
 async fn run_pcli2_asset_metadata_delete(args: Value) -> Result<String, String> {
     debug!("run_pcli2_asset_metadata_delete args={}", args);
-    let mut cmd_args: Vec<String> = vec!["asset".to_string(), "metadata".to_string(), "delete".to_string()];
+    let mut cmd_args: Vec<String> = vec![
+        "asset".to_string(),
+        "metadata".to_string(),
+        "delete".to_string(),
+    ];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
         cmd_args.push(tenant.to_string());
@@ -1501,7 +1786,11 @@ async fn run_pcli2_asset_metadata_delete(args: Value) -> Result<String, String> 
         cmd_args.push("--name".to_string());
         cmd_args.push(name);
     }
-    push_opt_string(&mut cmd_args, "-f", args.get("format").and_then(|v| v.as_str()));
+    push_opt_string(
+        &mut cmd_args,
+        "-f",
+        args.get("format").and_then(|v| v.as_str()),
+    );
     run_pcli2_command(cmd_args, "pcli2 asset metadata delete").await
 }
 
@@ -1528,8 +1817,14 @@ fn temp_thumbnail_path() -> Result<PathBuf, String> {
 }
 
 fn require_uuid_or_path(args: &Value) -> Result<(Option<String>, Option<String>), String> {
-    let uuid = args.get("uuid").and_then(|v| v.as_str()).map(str::to_string);
-    let path = args.get("path").and_then(|v| v.as_str()).map(str::to_string);
+    let uuid = args
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     if uuid.is_none() && path.is_none() {
         return Err("Missing required argument: provide either 'uuid' or 'path'".to_string());
     }
@@ -1546,9 +1841,35 @@ fn require_folder_uuid_or_path(args: &Value) -> Result<(Option<String>, Option<S
         .and_then(|v| v.as_str())
         .map(str::to_string);
     if uuid.is_none() && path.is_none() {
-        return Err("Missing required argument: provide either 'folder_uuid' or 'folder_path'".to_string());
+        return Err(
+            "Missing required argument: provide either 'folder_uuid' or 'folder_path'".to_string(),
+        );
     }
     Ok((uuid, path))
+}
+
+fn validate_range_f64(args: &Value, key: &str, min: f64, max: f64) -> Result<(), String> {
+    if let Some(value) = args.get(key).and_then(|v| v.as_f64())
+        && (value < min || value > max)
+    {
+        return Err(format!(
+            "Invalid argument '{}': value {} must be between {} and {}",
+            key, value, min, max
+        ));
+    }
+    Ok(())
+}
+
+fn validate_range_u64(args: &Value, key: &str, min: u64, max: u64) -> Result<(), String> {
+    if let Some(value) = args.get(key).and_then(|v| v.as_u64())
+        && (value < min || value > max)
+    {
+        return Err(format!(
+            "Invalid argument '{}': value {} must be between {} and {}",
+            key, value, min, max
+        ));
+    }
+    Ok(())
 }
 
 fn push_flag_if(cmd_args: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
@@ -1602,6 +1923,32 @@ fn shell_escape_arg(arg: &str) -> String {
     escaped
 }
 
+async fn read_limited<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|err| format!("Failed to read pcli2 {}: {}", label, err))?;
+        if read == 0 {
+            break;
+        }
+        if buf.len() + read > limit {
+            return Err(format!(
+                "pcli2 {} exceeded maximum output size of {} bytes",
+                label, limit
+            ));
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+    Ok(buf)
+}
+
 async fn run_pcli2_command(cmd_args: Vec<String>, label: &str) -> Result<String, String> {
     let rendered = cmd_args
         .iter()
@@ -1609,22 +1956,65 @@ async fn run_pcli2_command(cmd_args: Vec<String>, label: &str) -> Result<String,
         .collect::<Vec<_>>()
         .join(" ");
     info!("▶ pcli2 {}", rendered);
-    let output = tokio::process::Command::new("pcli2")
+    let mut child = tokio::process::Command::new("pcli2")
         .args(&cmd_args)
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to execute pcli2: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture pcli2 stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture pcli2 stderr".to_string())?;
 
-    if output.status.success() {
+    let stdout_task = tokio::spawn(read_limited(stdout, MAX_PCLI2_OUTPUT_BYTES, "stdout"));
+    let stderr_task = tokio::spawn(read_limited(stderr, MAX_PCLI2_OUTPUT_BYTES, "stderr"));
+
+    let output = tokio::time::timeout(PCLI2_TIMEOUT, async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| format!("Failed waiting for pcli2: {}", err))?;
+        let stdout = stdout_task
+            .await
+            .map_err(|err| format!("Failed to read pcli2 stdout: {}", err))??;
+        let stderr = stderr_task
+            .await
+            .map_err(|err| format!("Failed to read pcli2 stderr: {}", err))??;
+        Ok((status, stdout, stderr))
+    })
+    .await;
+
+    let (status, stdout, stderr) = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(message)) => {
+            let _ = child.kill().await;
+            return Err(message);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(format!(
+                "{} failed: timed out after {:?}",
+                label, PCLI2_TIMEOUT
+            ));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+
+    if status.success() {
         Ok(stdout.trim_end().to_string())
     } else {
         Err(format!(
             "{} failed (code {}):\n{}\n{}",
             label,
-            output.status,
+            status,
             stdout.trim_end(),
             stderr.trim_end()
         ))
@@ -1640,11 +2030,23 @@ fn print_banner() {
         "██║     ╚██████╗███████╗██║███████╗    ██║ ╚═╝ ██║╚██████╗██║     ",
         "╚═╝      ╚═════╝╚══════╝╚═╝╚══════╝    ╚═╝     ╚═╝ ╚═════╝╚═╝     ",
     ];
+    let use_color = std::io::stdout().is_terminal();
 
     for line in ascii {
-        println!("{}", gradient_line(line));
+        if use_color {
+            println!("{}", gradient_line(line));
+        } else {
+            println!("{}", line);
+        }
     }
-    println!("{}", gradient_line("          Model Context Protocol Server for PCLI2           "));
+    if use_color {
+        println!(
+            "{}",
+            gradient_line("          Model Context Protocol Server for PCLI2           ")
+        );
+    } else {
+        println!("          Model Context Protocol Server for PCLI2           ");
+    }
     println!("Version {}", APP_VERSION);
     println!();
 }
@@ -1680,6 +2082,8 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1759,5 +2163,92 @@ exit 1
         });
         let list = run_pcli2_tenant_list(args).await.expect("tenant list");
         assert_eq!(list.trim(), "tenant list ok");
+    }
+
+    #[tokio::test]
+    async fn mock_pcli2_error_includes_label() {
+        let script_path = make_mock_pcli2();
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let _guard = PathGuard {
+            original: original_path.clone(),
+        };
+        let mut new_path = script_path
+            .parent()
+            .expect("parent")
+            .to_string_lossy()
+            .to_string();
+        if !original_path.is_empty() {
+            new_path.push(':');
+            new_path.push_str(&original_path);
+        }
+        unsafe {
+            std::env::set_var("PATH", new_path);
+        }
+
+        let err = run_pcli2_command(vec!["oops".to_string()], "pcli2 oops")
+            .await
+            .expect_err("expected error");
+        assert!(err.contains("pcli2 oops failed"));
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_parse_error_returns_32700() {
+        let state = AppState {
+            server_name: "test".to_string(),
+            server_version: "0.0.0".to_string(),
+        };
+        let response = handle_mcp(State(state), Bytes::from("{bad json"))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["error"]["code"], -32700);
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_invalid_request_returns_32600() {
+        let state = AppState {
+            server_name: "test".to_string(),
+            server_version: "0.0.0".to_string(),
+        };
+        let response = handle_mcp(State(state), Bytes::from(r#"{"jsonrpc":"2.0","id":1}"#))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_notification_returns_no_content() {
+        let state = AppState {
+            server_name: "test".to_string(),
+            server_version: "0.0.0".to_string(),
+        };
+        let response = handle_mcp(
+            State(state),
+            Bytes::from(r#"{"jsonrpc":"2.0","method":"tools/list"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn validate_threshold_range() {
+        let args = json!({ "threshold": 120.0 });
+        assert!(validate_range_f64(&args, "threshold", 0.0, 100.0).is_err());
+    }
+
+    #[test]
+    fn validate_concurrent_range() {
+        let args = json!({ "concurrent": 0 });
+        assert!(validate_range_u64(&args, "concurrent", 1, 10).is_err());
     }
 }

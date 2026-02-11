@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "pcli2-mcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -461,6 +461,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
