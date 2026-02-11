@@ -50,30 +50,42 @@ flowchart LR
 
 1. Install PCLI2 and authenticate.
    Follow the PCLI2 docs and make sure `pcli2` is on your `PATH`: https://jchultarsky101.github.io/pcli2/
-2. Install the Rust toolchain (edition 2024).
-3. Build the server:
+2. Install `pcli2-mcp` (see Installation below).
+3. Run the server:
+
+   ```bash
+   pcli2-mcp serve --port 8080 --log-level info
+   ```
+4. Verify the server is healthy:
+
+   ```bash
+   curl -s http://localhost:8080/health
+   ```
+5. Generate a client config snippet:
+
+   ```bash
+   pcli2-mcp config --client claude --host localhost --port 8080
+   ```
+6. Paste the snippet into your client (see the sections below).
+
+## Installation
+
+Recommended (pre-built binaries):
+
+1. Download the latest release for your platform from:
+   https://github.com/jchultarsky101/pcli2-mcp/releases
+2. Put the `pcli2-mcp` binary somewhere on your `PATH`.
+
+Build from source:
+
+1. Install the Rust toolchain (edition 2024).
+2. Build:
 
    ```bash
    cargo build --release
    ```
 
    The binary will be at `target/release/pcli2-mcp`.
-4. Run the server:
-
-   ```bash
-   pcli2-mcp serve --port 8080 --log-level info
-   ```
-5. Verify the server is healthy:
-
-   ```bash
-   curl -s http://localhost:8080/health
-   ```
-6. Generate a client config snippet:
-
-   ```bash
-   pcli2-mcp config --client claude --host localhost --port 8080
-   ```
-7. Paste the snippet into your client (see the sections below).
 
 ## Documentation Site (Oranda)
 
