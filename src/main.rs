@@ -1514,8 +1514,37 @@ fn push_opt_u64(cmd_args: &mut Vec<String>, args: &Value, key: &str, flag: &str)
     }
 }
 
+fn shell_escape_arg(arg: &str) -> String {
+    let safe = arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='));
+    if safe && !arg.is_empty() {
+        return arg.to_string();
+    }
+
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+
+    let mut escaped = String::from("'");
+    for ch in arg.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\"'\"'");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
 async fn run_pcli2_command(cmd_args: Vec<String>, label: &str) -> Result<String, String> {
-    info!("executing: pcli2 {}", cmd_args.join(" "));
+    let rendered = cmd_args
+        .iter()
+        .map(|arg| shell_escape_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    info!("▶ pcli2 {}", rendered);
     let output = tokio::process::Command::new("pcli2")
         .args(&cmd_args)
         .output()

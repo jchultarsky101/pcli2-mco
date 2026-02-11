@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-02-11
+
+### Changed
+
+- Logged PCLI2 commands are now shell-escaped for copy/paste (with a compact emoji prefix).
+
 ## [0.1.4] - 2026-02-11
 
 ### Added
