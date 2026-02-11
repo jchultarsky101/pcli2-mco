@@ -16,10 +16,8 @@ use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tower::{ServiceBuilder, timeout::TimeoutLayer};
@@ -148,6 +146,13 @@ fn serve_command() -> Command {
     Command::new(CMD_SERVE)
         .about("Run the MCP server")
         .arg(
+            Arg::new(ARG_HOST)
+                .long("host")
+                .value_name("HOST")
+                .default_value(DEFAULT_HOST)
+                .help("Host to bind to (e.g. localhost or 0.0.0.0)"),
+        )
+        .arg(
             Arg::new(ARG_PORT)
                 .short('p')
                 .long("port")
@@ -207,6 +212,10 @@ fn help_command() -> Command {
 }
 
 async fn run_server(matches: &ArgMatches) -> Result<()> {
+    let host = matches
+        .get_one::<String>(ARG_HOST)
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_HOST);
     let port = *matches
         .get_one::<u16>(ARG_PORT)
         .ok_or_else(|| anyhow!("missing port"))?;
@@ -238,11 +247,11 @@ async fn run_server(matches: &ArgMatches) -> Result<()> {
                 .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
         );
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("listening on http://{}", addr);
+    let bind_addr = format!("{host}:{port}");
+    info!("listening on http://{}", bind_addr);
 
     axum::serve(
-        tokio::net::TcpListener::bind(addr).await?,
+        tokio::net::TcpListener::bind(&bind_addr).await?,
         app.into_make_service(),
     )
     .await?;
@@ -371,7 +380,7 @@ async fn handle_mcp(State(state): State<AppState>, bytes: Bytes) -> impl IntoRes
         }
     };
     if id.is_null() {
-        return StatusCode::NO_CONTENT.into_response();
+        return StatusCode::OK.into_response();
     }
 
     match method {
@@ -2092,8 +2101,9 @@ mod tests {
     use axum::response::IntoResponse;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Mutex;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -2161,7 +2171,7 @@ exit 1
 
     #[tokio::test]
     async fn mock_pcli2_version_and_tenant_list() {
-        let _lock = test_env_lock().lock().expect("lock test env");
+        let _lock = test_env_lock().lock().await;
         let script_path = make_mock_pcli2();
         let _guard = EnvVarGuard::set(PCLI2_BIN_ENV, script_path.to_string_lossy().as_ref());
 
@@ -2179,7 +2189,7 @@ exit 1
 
     #[tokio::test]
     async fn mock_pcli2_error_includes_label() {
-        let _lock = test_env_lock().lock().expect("lock test env");
+        let _lock = test_env_lock().lock().await;
         let script_path = make_mock_pcli2();
         let _guard = EnvVarGuard::set(PCLI2_BIN_ENV, script_path.to_string_lossy().as_ref());
 
@@ -2235,7 +2245,7 @@ exit 1
         )
         .await
         .into_response();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

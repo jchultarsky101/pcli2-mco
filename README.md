@@ -54,7 +54,7 @@ flowchart LR
 3. Run the server:
 
    ```bash
-   pcli2-mcp serve --port 8080 --log-level info
+   pcli2-mcp serve --host localhost --port 8080 --log-level info
    ```
 4. Verify the server is healthy:
 
@@ -139,8 +139,10 @@ Use the output in the sections below.
 Run the server:
 
 ```bash
-pcli2-mcp serve --port 8080 --log-level info
+pcli2-mcp serve --host localhost --port 8080 --log-level info
 ```
+
+Use `--host 0.0.0.0` to listen on all interfaces.
 
 Print client config (pretty JSON):
 
