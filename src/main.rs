@@ -19,6 +19,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tower::{ServiceBuilder, timeout::TimeoutLayer};
@@ -57,6 +58,7 @@ const MAX_REQUEST_BYTES: usize = 1_048_576;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PCLI2_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_PCLI2_OUTPUT_BYTES: usize = 200 * 1024 * 1024;
+const PCLI2_BIN_ENV: &str = "PCLI2_BIN";
 
 #[derive(Clone)]
 struct AppState {
@@ -1956,7 +1958,7 @@ async fn run_pcli2_command(cmd_args: Vec<String>, label: &str) -> Result<String,
         .collect::<Vec<_>>()
         .join(" ");
     info!("▶ pcli2 {}", rendered);
-    let mut child = tokio::process::Command::new("pcli2")
+    let mut child = tokio::process::Command::new(pcli2_executable())
         .args(&cmd_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2019,6 +2021,10 @@ async fn run_pcli2_command(cmd_args: Vec<String>, label: &str) -> Result<String,
             stderr.trim_end()
         ))
     }
+}
+
+fn pcli2_executable() -> String {
+    env::var(PCLI2_BIN_ENV).unwrap_or_else(|_| "pcli2".to_string())
 }
 
 fn print_banner() {
@@ -2086,18 +2092,38 @@ mod tests {
     use axum::response::IntoResponse;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct PathGuard {
-        original: String,
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
     }
 
-    impl Drop for PathGuard {
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             unsafe {
-                std::env::set_var("PATH", &self.original);
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
             }
         }
+    }
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn make_mock_pcli2() -> PathBuf {
@@ -2135,23 +2161,9 @@ exit 1
 
     #[tokio::test]
     async fn mock_pcli2_version_and_tenant_list() {
+        let _lock = test_env_lock().lock().expect("lock test env");
         let script_path = make_mock_pcli2();
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let _guard = PathGuard {
-            original: original_path.clone(),
-        };
-        let mut new_path = script_path
-            .parent()
-            .expect("parent")
-            .to_string_lossy()
-            .to_string();
-        if !original_path.is_empty() {
-            new_path.push(':');
-            new_path.push_str(&original_path);
-        }
-        unsafe {
-            std::env::set_var("PATH", new_path);
-        }
+        let _guard = EnvVarGuard::set(PCLI2_BIN_ENV, script_path.to_string_lossy().as_ref());
 
         let version = run_pcli2_version().await.expect("version");
         assert_eq!(version.trim(), "pcli2 9.9.9");
@@ -2167,23 +2179,9 @@ exit 1
 
     #[tokio::test]
     async fn mock_pcli2_error_includes_label() {
+        let _lock = test_env_lock().lock().expect("lock test env");
         let script_path = make_mock_pcli2();
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        let _guard = PathGuard {
-            original: original_path.clone(),
-        };
-        let mut new_path = script_path
-            .parent()
-            .expect("parent")
-            .to_string_lossy()
-            .to_string();
-        if !original_path.is_empty() {
-            new_path.push(':');
-            new_path.push_str(&original_path);
-        }
-        unsafe {
-            std::env::set_var("PATH", new_path);
-        }
+        let _guard = EnvVarGuard::set(PCLI2_BIN_ENV, script_path.to_string_lossy().as_ref());
 
         let err = run_pcli2_command(vec!["oops".to_string()], "pcli2 oops")
             .await
