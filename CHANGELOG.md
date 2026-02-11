@@ -6,6 +6,18 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-02-11
+
+### Added
+
+- Request body size limits and timeouts for MCP HTTP requests.
+- PCLI2 command timeouts and max output size enforcement.
+
+### Changed
+
+- Stricter JSON-RPC request validation for required fields and types.
+- Tool schema construction refactored for consistency and reuse.
+
 ## [0.1.7] - 2026-02-11
 
 ### Added
