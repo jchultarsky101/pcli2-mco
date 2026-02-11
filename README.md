@@ -202,6 +202,42 @@ agent = Assistant(
 )
 ```
 
+### MCPHost (Local Ollama)
+
+MCPHost can use a local Ollama model and connect to this MCP server over HTTP.
+
+1. Install Ollama, pull a model, and make sure the daemon is running:
+
+   ```bash
+   ollama pull mistral
+   ollama serve
+   ```
+
+2. Install MCPHost:
+
+   ```bash
+   go install github.com/mark3labs/mcphost@latest
+   ```
+
+3. Create a config file (preferred locations include `~/.mcphost.yml` or `~/.mcphost.json`) and point it at your local MCP server:
+
+   ```yaml
+   # ~/.mcphost.yml
+   mcpServers:
+     pcli2:
+       type: "remote"
+       url: "http://localhost:8080/mcp"
+
+   # Use a local model with function-calling support
+   model: "ollama:mistral"
+   ```
+
+4. Run MCPHost:
+
+   ```bash
+   mcphost
+   ```
+
 ### Other MCP Clients
 
 Most MCP-compatible clients accept the same `mcpServers` JSON block. Use the output of `pcli2-mcp config` as the server definition and follow your client’s MCP documentation.
