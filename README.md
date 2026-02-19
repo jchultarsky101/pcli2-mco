@@ -16,7 +16,7 @@ Project links:
 - `pcli2-mcp`: https://github.com/jchultarsky101/pcli2-mcp
 - `pcli2`: https://github.com/jchultarsky101/pcli2
 
-**Status:** early development (v0.1.8).
+**Status:** early development (v0.1.10).
 
 ## Main Concepts
 

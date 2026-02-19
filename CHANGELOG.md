@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-02-19
+
+### Fixed
+
+- Verified correct MIME type handling for thumbnail downloads (`image/png` with PNG magic byte validation).
+
 ## [0.1.9] - 2026-02-12
 
 ### Added
