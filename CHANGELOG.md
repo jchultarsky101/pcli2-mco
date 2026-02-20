@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.1.11] - 2026-02-19
+
+### Added
+
+- Thumbnail cache for efficient image serving via HTTP URLs (`/thumbnail/:cache_key`)
+- New tool `pcli2_thumbnail_cache_cleanup` to remove expired thumbnails
+- Disk-based cache at `~/.pcli2-mcp/thumbnails/` with configurable TTL (default 24 hours)
+- HTML response for `pcli2_asset_thumbnail` with embedded image URL instead of base64 data
+
+### Changed
+
+- `pcli2_asset_thumbnail` now returns HTML with image URL instead of base64-encoded image data
+- AppState extended to include optional thumbnail cache reference
 
 ## [0.1.10] - 2026-02-19
 

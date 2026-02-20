@@ -1,6 +1,6 @@
 [package]
 name = "pcli2-mcp"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 repository = "https://github.com/jchultarsky101/pcli2-mcp"
 
@@ -10,6 +10,7 @@ axum = "0.7.9"
 base64 = "0.22.1"
 chrono = { version = "0.4.38", features = ["clock"] }
 clap = "4.5.55"
+http = "1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }

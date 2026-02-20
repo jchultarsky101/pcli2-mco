@@ -16,7 +16,7 @@ Project links:
 - `pcli2-mcp`: https://github.com/jchultarsky101/pcli2-mcp
 - `pcli2`: https://github.com/jchultarsky101/pcli2
 
-**Status:** early development (v0.1.10).
+**Status:** early development (v0.1.11).
 
 ## Main Concepts
 
@@ -122,6 +122,8 @@ The GitHub Pages workflow (`.github/workflows/docs.yml`) publishes the site from
 - MCP over HTTP (`/mcp`) with JSON-RPC 2.0
 - Tool wrapper for `pcli2 folder list` and `pcli2 asset list`
 - Tool wrapper for `pcli2 asset geometric-match`
+- **Thumbnail caching**: Thumbnails are cached on disk and served via HTTP URLs, avoiding large base64 payloads in MCP responses
+- **Thumbnail cleanup tool**: Remove expired thumbnails to free up disk space
 - Simple, single-binary Rust server
 - Comprehensive unit and integration tests
 - Improved banner formatting with centered version display
@@ -315,6 +317,7 @@ Notes:
 | `pcli2_asset_get` | `pcli2 asset get` | `uuid` or `path` |
 | `pcli2_asset_dependencies` | `pcli2 asset dependencies` | `uuid` or `path` |
 | `pcli2_asset_thumbnail` | `pcli2 asset thumbnail` | `uuid` or `path` |
+| `pcli2_thumbnail_cache_cleanup` | Cleanup expired thumbnails | none |
 | `pcli2_geometric_match` | `pcli2 asset geometric-match` | `uuid` or `path` |
 | `pcli2_asset_part_match` | `pcli2 asset part-match` | `uuid` or `path` |
 | `pcli2_asset_visual_match` | `pcli2 asset visual-match` | `uuid` or `path` |
@@ -337,6 +340,37 @@ Example:
       "format": "csv",
       "headers": true
     }
+  }
+}
+```
+
+## Thumbnail Cache
+
+The `pcli2_asset_thumbnail` tool now uses a disk-based cache to serve thumbnails efficiently:
+
+- **Cache location**: `~/.pcli2-mcp/thumbnails/`
+- **Default TTL**: 24 hours
+- **HTTP endpoint**: `http://localhost:PORT/thumbnail/:cache_key`
+
+When you call `pcli2_asset_thumbnail`, the server:
+1. Generates the thumbnail using PCLI2
+2. Saves it to the cache directory with metadata
+3. Returns an HTML snippet with an `<img>` tag pointing to the cached URL
+
+This approach avoids transmitting large base64-encoded images in MCP responses (50K+ tokens), reducing it to a simple HTML file reference (~200 tokens).
+
+### Cleaning Up Expired Thumbnails
+
+Use the `pcli2_thumbnail_cache_cleanup` tool to remove expired thumbnails and free up disk space:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "pcli2_thumbnail_cache_cleanup",
+    "arguments": {}
   }
 }
 ```

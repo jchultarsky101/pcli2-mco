@@ -10,6 +10,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::info;
 
+use crate::thumbnail::ThumbnailCache;
+
 pub const PCLI2_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 pub const MAX_PCLI2_OUTPUT_BYTES: usize = 200 * 1024 * 1024;
 pub const PCLI2_BIN_ENV: &str = "PCLI2_BIN";
@@ -629,10 +631,21 @@ pub fn tool_list() -> Vec<Value> {
         },
     );
 
+    define_tool(
+        &mut tools,
+        "pcli2_thumbnail_cache_cleanup",
+        "Removes expired thumbnails from the cache to free up disk space.",
+        &[],
+        |_| {},
+    );
+
     tools
 }
 
-pub async fn call_tool(params: Value) -> Result<Value, String> {
+pub async fn call_tool(
+    params: Value,
+    thumbnail_cache: Option<&ThumbnailCache>,
+) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -700,19 +713,22 @@ pub async fn call_tool(params: Value) -> Result<Value, String> {
             run_pcli2_asset_dependencies(args).await,
         ),
         "pcli2_asset_thumbnail" => {
-            let encoded = run_pcli2_asset_thumbnail(args).await?;
-            let data_url = format!("data:image/png;base64,{}", encoded);
+            let url = run_pcli2_asset_thumbnail(args, thumbnail_cache).await?;
+            // Return HTML that embeds the thumbnail image via URL
+            let html = format!(
+                r#"<!DOCTYPE html>
+<html>
+<head><title>Asset Thumbnail</title></head>
+<body>
+<img src="{}" alt="Asset Thumbnail" style="max-width: 100%; height: auto;">
+</body>
+</html>"#,
+                url
+            );
             Ok(json!({
                 "content": [{
-                    "type": "image",
-                    "mimeType": "image/png",
-                    "annotations": {
-                        "audience": ["user"]
-                    },
-                    "data": encoded
-                }, {
                     "type": "text",
-                    "text": data_url
+                    "text": html
                 }]
             }))
         }
@@ -749,6 +765,25 @@ pub async fn call_tool(params: Value) -> Result<Value, String> {
             "pcli2 asset metadata delete",
             run_pcli2_asset_metadata_delete(args).await,
         ),
+        "pcli2_thumbnail_cache_cleanup" => {
+            let Some(cache) = thumbnail_cache else {
+                return Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "Thumbnail cache is not available"
+                    }]
+                }));
+            };
+            match cache.cleanup_expired() {
+                Ok(count) => Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Cleaned up {} expired thumbnail(s)", count)
+                    }]
+                })),
+                Err(err) => Err(format!("Thumbnail cache cleanup failed: {}", err)),
+            }
+        }
         _ => Err(format!("Unknown tool '{}'", name)),
     }
 }
@@ -1167,7 +1202,10 @@ async fn run_pcli2_asset_dependencies(args: Value) -> Result<String, String> {
     run_pcli2_command(cmd_args, "pcli2 asset dependencies").await
 }
 
-async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
+async fn run_pcli2_asset_thumbnail(
+    args: Value,
+    thumbnail_cache: Option<&ThumbnailCache>,
+) -> Result<String, String> {
     let mut cmd_args: Vec<String> = vec!["asset".to_string(), "thumbnail".to_string()];
     if let Some(tenant) = args.get("tenant").and_then(|v| v.as_str()) {
         cmd_args.push("-t".to_string());
@@ -1190,8 +1228,16 @@ async fn run_pcli2_asset_thumbnail(args: Value) -> Result<String, String> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("Thumbnail output was not a valid PNG file.".to_string());
     }
-    let encoded = BASE64_STANDARD.encode(bytes);
-    Ok(encoded)
+
+    // Save to cache if available, otherwise return base64
+    if let Some(cache) = thumbnail_cache {
+        let source = uuid.or(path).unwrap_or_else(|| "unknown".to_string());
+        let (_cache_key, url) = cache.save_thumbnail(&source, &bytes)?;
+        Ok(url)
+    } else {
+        let encoded = BASE64_STANDARD.encode(bytes);
+        Ok(format!("data:image/png;base64,{}", encoded))
+    }
 }
 
 async fn run_pcli2_asset_reprocess(args: Value) -> Result<String, String> {

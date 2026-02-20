@@ -3,18 +3,22 @@ pub mod error;
 pub mod mcp;
 pub mod pcli;
 pub mod server;
+pub mod thumbnail;
 
 use anyhow::Result;
 use clap::ArgMatches;
 use cli::{ARG_LOG_LEVEL, CMD_CONFIG, CMD_HELP, CMD_SERVE, build_cli};
 use mcp::run_config;
 use server::run_server;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use thumbnail::ThumbnailCache;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
 #[derive(Clone)]
 pub struct AppState {
     pub server_name: String,
     pub server_version: String,
+    pub thumbnail_cache: Arc<Option<ThumbnailCache>>,
 }
 
 pub async fn run() -> Result<()> {
@@ -85,6 +89,7 @@ mod tests {
         let state = AppState {
             server_name: "test-server".to_string(),
             server_version: "1.0.0".to_string(),
+            thumbnail_cache: Arc::new(None),
         };
         let cloned_state = state.clone();
 
