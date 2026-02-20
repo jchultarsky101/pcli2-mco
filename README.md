@@ -346,18 +346,22 @@ Example:
 
 ## Thumbnail Cache
 
-The `pcli2_asset_thumbnail` tool uses a disk-based cache to serve thumbnails efficiently. It supports two response modes via the `response_mode` parameter:
+The `pcli2_asset_thumbnail` tool uses a disk-based cache to serve thumbnails efficiently. It supports two response modes via the `response_mode` parameter.
+
+> **⚠️ Recommended: Use `response_mode="url"` (default)**
+>
+> For LLM workflows, **always prefer `url` mode**. It returns a short HTTP URL (~200 tokens) that the client fetches automatically. The `data_url` mode returns ~50K tokens of base64 data, which LLMs often mangle, truncate, or re-encode incorrectly.
 
 ### Response Modes
 
 | Mode | Description | Token Usage | When to Use |
 |------|-------------|-------------|-------------|
-| `url` (default) | Returns an HTTP URL like `http://localhost:8080/thumbnail/:cache_key` | ~200 tokens | Default choice. Best for saving context space. The client fetches the image via HTTP. |
-| `data_url` | Returns a base64 data URI like `data:image/png;base64,...` | ~50K tokens | Use when your client cannot make HTTP requests or when you need the image to render immediately in markdown without a second fetch. |
+| `url` (default) | Returns an HTTP URL like `http://localhost:8080/thumbnail/:cache_key` | ~200 tokens | **Recommended for all LLM workflows.** The client fetches the image via HTTP automatically. Images render correctly in markdown without LLM handling the image data. |
+| `data_url` | Returns a base64 data URI like `data:image/png;base64,...` | ~50K tokens | **Not recommended for LLM use.** Only use when the client cannot make HTTP requests. LLMs often corrupt large base64 strings, causing broken or mangled images. |
 
 ### Usage Examples
 
-**Efficient mode (default):**
+**Efficient mode (default, recommended):**
 ```json
 {
   "jsonrpc": "2.0",
@@ -372,7 +376,7 @@ The `pcli2_asset_thumbnail` tool uses a disk-based cache to serve thumbnails eff
 }
 ```
 
-**Self-contained mode (immediate rendering):**
+**Self-contained mode (not recommended for LLM):**
 ```json
 {
   "jsonrpc": "2.0",
@@ -394,8 +398,8 @@ When you call `pcli2_asset_thumbnail`:
 1. The server generates the thumbnail using PCLI2
 2. Saves it to the cache directory with metadata
 3. Returns an HTML snippet with an `<img>` tag pointing to either:
-   - A cached HTTP URL (`response_mode="url"`)
-   - An embedded base64 data URI (`response_mode="data_url"`)
+   - A cached HTTP URL (`response_mode="url"`) - **recommended**
+   - An embedded base64 data URI (`response_mode="data_url"`) - **not recommended for LLM**
 
 ### Cache Details
 
