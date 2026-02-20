@@ -113,6 +113,7 @@ async fn jsonrpc_parse_error_returns_32700() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
     let response = handle_mcp(State(state), Bytes::from("{bad json"))
         .await
@@ -130,6 +131,7 @@ async fn jsonrpc_invalid_request_returns_32600() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
     let response = handle_mcp(State(state), Bytes::from(r#"{"jsonrpc":"2.0","id":1}"#))
         .await
@@ -147,6 +149,7 @@ async fn jsonrpc_notification_returns_no_content() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
     let response = handle_mcp(
         State(state),
@@ -171,6 +174,7 @@ async fn logging_on_tools_call_outputs_command() {
     let state = AppState {
         server_name: "mock".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
 
     let request = json!({
@@ -193,6 +197,7 @@ async fn test_initialize_method() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
 
     let request = json!({
@@ -221,6 +226,7 @@ async fn test_tools_list_method() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
 
     let request = json!({
@@ -248,6 +254,7 @@ async fn test_unknown_method_returns_error() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
 
     let request = json!({
@@ -274,6 +281,7 @@ async fn test_jsonrpc_wrong_version() {
     let state = AppState {
         server_name: "test".to_string(),
         server_version: "0.0.0".to_string(),
+        thumbnail_cache: std::sync::Arc::new(None),
     };
 
     let request = json!({

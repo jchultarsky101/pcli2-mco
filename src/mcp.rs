@@ -174,7 +174,7 @@ pub async fn handle_mcp(State(state): State<AppState>, bytes: Bytes) -> impl Int
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
             info!("🔧 tools/call name={}", tool_name);
-            match call_tool(params).await {
+            match call_tool(params, state.thumbnail_cache.as_ref().as_ref()).await {
                 Ok(result) => json_ok(id, result).into_response(),
                 Err(message) => json_error(id, -32602, message).into_response(),
             }

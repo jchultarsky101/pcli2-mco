@@ -558,6 +558,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "http",
  "serde",
  "serde_json",
  "tokio",

@@ -1,22 +1,32 @@
 use crate::AppState;
 use crate::cli::{ARG_HOST, ARG_PORT, DEFAULT_HOST};
 use crate::mcp::handle_mcp;
+use crate::thumbnail::{ThumbnailCache, ThumbnailCacheConfig, default_cache_dir};
 use anyhow::{Result, anyhow};
+use axum::body::Body;
+use axum::response::Response;
 use axum::{
-    BoxError, Router, error_handling::HandleErrorLayer, extract::DefaultBodyLimit,
-    http::StatusCode, response::IntoResponse, routing::get,
+    BoxError, Router,
+    error_handling::HandleErrorLayer,
+    extract::{DefaultBodyLimit, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
 };
 use chrono::Utc;
 use clap::ArgMatches;
+use http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use std::io::IsTerminal;
+use std::sync::Arc;
 use std::time::Duration;
 use tower::{ServiceBuilder, timeout::TimeoutLayer};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const SERVER_NAME: &str = "mcp-http-server";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_REQUEST_BYTES: usize = 1_048_576;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const THUMBNAIL_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 pub async fn run_server(matches: &ArgMatches) -> Result<()> {
     let host = matches
@@ -29,14 +39,37 @@ pub async fn run_server(matches: &ArgMatches) -> Result<()> {
 
     print_banner();
 
+    // Initialize thumbnail cache
+    let thumbnail_cache = match default_cache_dir() {
+        Ok(cache_dir) => {
+            let config = ThumbnailCacheConfig::new(cache_dir, THUMBNAIL_TTL, host, port);
+            match ThumbnailCache::new(config) {
+                Ok(cache) => {
+                    info!("Thumbnail cache initialized at {:?}", cache.cache_dir());
+                    Some(cache)
+                }
+                Err(err) => {
+                    warn!("Failed to initialize thumbnail cache: {}", err);
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            warn!("Could not determine thumbnail cache directory: {}", err);
+            None
+        }
+    };
+
     let state = AppState {
         server_name: SERVER_NAME.to_string(),
         server_version: APP_VERSION.to_string(),
+        thumbnail_cache: Arc::new(thumbnail_cache),
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/mcp", axum::routing::post(handle_mcp))
+        .route("/thumbnail/:cache_key", get(serve_thumbnail))
         .with_state(state)
         .layer(
             ServiceBuilder::new()
@@ -76,6 +109,40 @@ pub async fn run_server(matches: &ArgMatches) -> Result<()> {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn serve_thumbnail(
+    Path(cache_key): Path<String>,
+    state: State<AppState>,
+) -> impl IntoResponse {
+    let Some(cache) = state.thumbnail_cache.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Thumbnail cache not available",
+        )
+            .into_response();
+    };
+
+    match cache.load_thumbnail(&cache_key) {
+        Ok(data) => {
+            let mut response = Response::new(Body::from(data));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, "image/png".parse().unwrap());
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, "public, max-age=3600".parse().unwrap());
+            response
+        }
+        Err(err) => {
+            debug!("Failed to serve thumbnail {}: {}", cache_key, err);
+            (
+                StatusCode::NOT_FOUND,
+                format!("Thumbnail not found: {}", err),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn print_banner() {
