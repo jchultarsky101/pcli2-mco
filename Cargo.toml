@@ -1,6 +1,6 @@
 [package]
 name = "pcli2-mcp"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 repository = "https://github.com/jchultarsky101/pcli2-mcp"
 
