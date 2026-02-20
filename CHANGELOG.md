@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.12] - 2026-02-20
+
+### Changed
+
+- Documentation: emphasize `url` mode is recommended for LLM thumbnail workflows over `data_url` mode
+
 ## [0.1.11] - 2026-02-19
 
 ### Added
