@@ -525,11 +525,21 @@ pub fn tool_list() -> Vec<Value> {
     define_tool(
         &mut tools,
         "pcli2_asset_thumbnail",
-        "Runs `pcli2 asset thumbnail` and returns a base64-encoded PNG.",
+        "Runs `pcli2 asset thumbnail` and returns the thumbnail image. Use `response_mode` to control the output format: 'url' returns an HTTP URL (efficient for LLM context, requires HTTP fetch), 'data_url' returns a base64 data URI (self-contained, uses more tokens but renders immediately in markdown).",
         &[],
         |props| {
             add_tenant(props);
             add_uuid_path(props);
+            add_prop(
+                props,
+                "response_mode",
+                json!({
+                    "type": "string",
+                    "enum": ["url", "data_url"],
+                    "default": "url",
+                    "description": "Output format: 'url' returns an HTTP URL (efficient for LLM context, ~200 tokens), 'data_url' returns a base64 data URI (self-contained image, ~50K tokens but renders immediately in markdown without HTTP fetch). Use 'data_url' when the client cannot make HTTP requests or when you need the image to display immediately."
+                }),
+            );
         },
     );
 
@@ -713,8 +723,9 @@ pub async fn call_tool(
             run_pcli2_asset_dependencies(args).await,
         ),
         "pcli2_asset_thumbnail" => {
-            let url = run_pcli2_asset_thumbnail(args, thumbnail_cache).await?;
-            // Return HTML that embeds the thumbnail image via URL
+            let src = run_pcli2_asset_thumbnail(args, thumbnail_cache).await?;
+            // Return HTML that embeds the thumbnail image
+            // src can be either an HTTP URL (response_mode=url) or a data URI (response_mode=data_url)
             let html = format!(
                 r#"<!DOCTYPE html>
 <html>
@@ -723,7 +734,7 @@ pub async fn call_tool(
 <img src="{}" alt="Asset Thumbnail" style="max-width: 100%; height: auto;">
 </body>
 </html>"#,
-                url
+                src
             );
             Ok(json!({
                 "content": [{
@@ -1229,14 +1240,41 @@ async fn run_pcli2_asset_thumbnail(
         return Err("Thumbnail output was not a valid PNG file.".to_string());
     }
 
-    // Save to cache if available, otherwise return base64
-    if let Some(cache) = thumbnail_cache {
-        let source = uuid.or(path).unwrap_or_else(|| "unknown".to_string());
-        let (_cache_key, url) = cache.save_thumbnail(&source, &bytes)?;
-        Ok(url)
-    } else {
-        let encoded = BASE64_STANDARD.encode(bytes);
-        Ok(format!("data:image/png;base64,{}", encoded))
+    // Determine response mode (default to "url" for efficiency)
+    let response_mode = args
+        .get("response_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("url");
+
+    match response_mode {
+        "data_url" => {
+            // Return base64-encoded data URI (self-contained, uses more tokens)
+            let encoded = BASE64_STANDARD.encode(bytes);
+            Ok(format!("data:image/png;base64,{}", encoded))
+        }
+        "url" => {
+            // Save to cache and return HTTP URL (efficient for LLM context)
+            if let Some(cache) = thumbnail_cache {
+                let source = uuid.or(path).unwrap_or_else(|| "unknown".to_string());
+                let (_cache_key, url) = cache.save_thumbnail(&source, &bytes)?;
+                Ok(url)
+            } else {
+                // Fallback to data URL if cache is not available
+                let encoded = BASE64_STANDARD.encode(bytes);
+                Ok(format!("data:image/png;base64,{}", encoded))
+            }
+        }
+        _ => {
+            // Unknown mode, default to URL behavior
+            if let Some(cache) = thumbnail_cache {
+                let source = uuid.or(path).unwrap_or_else(|| "unknown".to_string());
+                let (_cache_key, url) = cache.save_thumbnail(&source, &bytes)?;
+                Ok(url)
+            } else {
+                let encoded = BASE64_STANDARD.encode(bytes);
+                Ok(format!("data:image/png;base64,{}", encoded))
+            }
+        }
     }
 }
 

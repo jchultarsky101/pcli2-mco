@@ -346,18 +346,62 @@ Example:
 
 ## Thumbnail Cache
 
-The `pcli2_asset_thumbnail` tool now uses a disk-based cache to serve thumbnails efficiently:
+The `pcli2_asset_thumbnail` tool uses a disk-based cache to serve thumbnails efficiently. It supports two response modes via the `response_mode` parameter:
+
+### Response Modes
+
+| Mode | Description | Token Usage | When to Use |
+|------|-------------|-------------|-------------|
+| `url` (default) | Returns an HTTP URL like `http://localhost:8080/thumbnail/:cache_key` | ~200 tokens | Default choice. Best for saving context space. The client fetches the image via HTTP. |
+| `data_url` | Returns a base64 data URI like `data:image/png;base64,...` | ~50K tokens | Use when your client cannot make HTTP requests or when you need the image to render immediately in markdown without a second fetch. |
+
+### Usage Examples
+
+**Efficient mode (default):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "pcli2_asset_thumbnail",
+    "arguments": {
+      "path": "/Root/Folder/Part.stl"
+    }
+  }
+}
+```
+
+**Self-contained mode (immediate rendering):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "pcli2_asset_thumbnail",
+    "arguments": {
+      "path": "/Root/Folder/Part.stl",
+      "response_mode": "data_url"
+    }
+  }
+}
+```
+
+### How It Works
+
+When you call `pcli2_asset_thumbnail`:
+1. The server generates the thumbnail using PCLI2
+2. Saves it to the cache directory with metadata
+3. Returns an HTML snippet with an `<img>` tag pointing to either:
+   - A cached HTTP URL (`response_mode="url"`)
+   - An embedded base64 data URI (`response_mode="data_url"`)
+
+### Cache Details
 
 - **Cache location**: `~/.pcli2-mcp/thumbnails/`
 - **Default TTL**: 24 hours
 - **HTTP endpoint**: `http://localhost:PORT/thumbnail/:cache_key`
-
-When you call `pcli2_asset_thumbnail`, the server:
-1. Generates the thumbnail using PCLI2
-2. Saves it to the cache directory with metadata
-3. Returns an HTML snippet with an `<img>` tag pointing to the cached URL
-
-This approach avoids transmitting large base64-encoded images in MCP responses (50K+ tokens), reducing it to a simple HTML file reference (~200 tokens).
 
 ### Cleaning Up Expired Thumbnails
 
